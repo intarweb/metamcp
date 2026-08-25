@@ -535,6 +535,19 @@ export class McpServerPool {
           error,
         );
       });
+      // This discarded spawn was counted in createNewConnection's namespace
+      // accounting (it is not the one stored, and no sessionNamespaces entry
+      // exists for the kept one to decrement on) — balance the counter so a
+      // discarded connection can't deflate a namespace's free headroom.
+      if (namespaceUuid) {
+        this.namespaceConnections.set(
+          namespaceUuid,
+          Math.max(
+            0,
+            (this.namespaceConnections.get(namespaceUuid) || 0) - 1,
+          ),
+        );
+      }
       return this.activeSessions[sessionId][serverUuid];
     }
 
@@ -552,6 +565,18 @@ export class McpServerPool {
           error,
         );
       });
+      // The spawned process never entered the pool and no session namespace was
+      // ever recorded for it — the increment in createNewConnection would
+      // otherwise leak into the per-namespace cap and starve the namespace.
+      if (namespaceUuid) {
+        this.namespaceConnections.set(
+          namespaceUuid,
+          Math.max(
+            0,
+            (this.namespaceConnections.get(namespaceUuid) || 0) - 1,
+          ),
+        );
+      }
       return undefined;
     }
     this.activeSessions[sessionId][serverUuid] = newClient;
@@ -592,73 +617,6 @@ export class McpServerPool {
         );
         return undefined;
       }
-    }
-
-    // Track the connection against its namespace (for the per-namespace cap).
-    // We increment BEFORE the connect and decrement on cleanup.
-    if (namespaceUuid) {
-      this.namespaceConnections.set(
-        namespaceUuid,
-        (this.namespaceConnections.get(namespaceUuid) || 0) + 1,
-      );
-    }
-
-    logger.info(
-      `Creating new connection for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
-    );
-    metamcpLogStore.addLog(
-      params.name,
-      "info",
-      `Creating new connection for namespace ${namespaceUuid || "none"}`,
-    );
-
-    const connectedClient = await connectMetaMcpClient(
-      params,
-      (exitCode, signal) => {
-        logger.info(
-          `Crash handler callback called for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
-        );
-
-        // Handle process crash - always set up crash handler
-        if (namespaceUuid) {
-          // If we have a namespace context, use it
-          this.handleServerCrash(
-            params.uuid,
-            namespaceUuid,
-            exitCode,
-            signal,
-          ).catch((error) => {
-            logger.error(
-              `Error handling server crash for ${params.uuid} in ${namespaceUuid}:`,
-              error,
-            );
-          });
-        } else {
-          // If no namespace context, still track the crash globally
-          this.handleServerCrashWithoutNamespace(
-            params.uuid,
-            exitCode,
-            signal,
-          ).catch((error) => {
-            logger.error(
-              `Error handling server crash for ${params.uuid} (no namespace):`,
-              error,
-            );
-          });
-        }
-      },
-    );
-    if (!connectedClient) {
-      // Connect failed — roll back the namespace counter.
-      if (namespaceUuid) {
-        const nsCount = this.namespaceConnections.get(namespaceUuid) || 0;
-        this.namespaceConnections.set(
-          namespaceUuid,
-          Math.max(0, nsCount - 1),
-        );
-      }
-      return undefined;
-    }
     }
 
     // Bound spawn concurrency. A cold start can queue many servers behind

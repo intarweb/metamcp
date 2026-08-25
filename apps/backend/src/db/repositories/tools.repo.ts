@@ -164,9 +164,18 @@ export class ToolsRepository {
   /**
    * Sync tools for a server: upsert current tools and delete obsolete ones
    * @param input - Tool upsert input containing tools and server UUID
+   * @param namespaceUuid - optional namespace to (re)write namespace_tool_mappings
+   *   for. The background tools-sync loop passes this so the DB fast path's
+   *   readToolsForNamespace (which INNER JOINs namespace_tool_mappings) actually
+   *   finds the synced tools — without it, a freshly-synced server serves an
+   *   EMPTY tool list on the DB path. The admin TRPC refresh passes none (it
+   *   writes mappings via the namespace layer).
    * @returns Object with upserted and deleted tools
    */
-  async syncTools(input: ToolUpsertInput): Promise<{
+  async syncTools(
+    input: ToolUpsertInput,
+    namespaceUuid?: string,
+  ): Promise<{
     upserted: DatabaseTool[];
     deleted: DatabaseTool[];
   }> {
@@ -182,6 +191,32 @@ export class ToolsRepository {
     let upserted: DatabaseTool[] = [];
     if (input.tools.length > 0) {
       upserted = await this.bulkUpsert(input);
+    }
+
+    // CRITICAL: ensure namespace_tool_mappings exist for the synced tools so the
+    // DB fast path (readToolsForNamespace INNER JOIN) serves them. The background
+    // sync loop writes tools but historically never wrote mappings — the hot path
+    // then returned EMPTY for every freshly-synced namespace (silent 0-tools).
+    if (namespaceUuid && upserted.length > 0) {
+      await db
+        .insert(namespaceToolMappingsTable)
+        .values(
+          upserted.map((tool) => ({
+            namespace_uuid: namespaceUuid,
+            tool_uuid: tool.uuid,
+            mcp_server_uuid: tool.mcp_server_uuid,
+            status: "ACTIVE" as const,
+          })),
+        )
+        .onConflictDoUpdate({
+          target: [
+            namespaceToolMappingsTable.namespace_uuid,
+            namespaceToolMappingsTable.tool_uuid,
+          ],
+          set: {
+            status: "ACTIVE" as const,
+          },
+        });
     }
 
     return { upserted, deleted };

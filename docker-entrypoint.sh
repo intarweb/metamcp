@@ -14,11 +14,32 @@ wait_for_postgres() {
     echo "PostgreSQL is ready!"
 }
 
+# Wait until a local TCP port accepts connections (bounded). The old code used
+# a fixed `sleep 3` + `kill -0`, which misclassified a slow-but-healthy boot as
+# dead and exited the container — a restart loop on cold caches. Probing the
+# actual port proves the service is LISTENING, not merely that the wrapper
+# process is alive.
+wait_for_port() {
+    local host="$1"
+    local port="$2"
+    local timeout_s="${3:-60}"
+    local deadline=$(( $(date +%s) + timeout_s ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if curl -fsS -o /dev/null "http://${host}:${port}/health" 2>/dev/null; then
+            echo "✅ Service on ${host}:${port} is healthy"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "❌ Service on ${host}:${port} did not become healthy within ${timeout_s}s"
+    return 1
+}
+
 # Function to run migrations
 run_migrations() {
     echo "Running database migrations..."
     cd /app/apps/backend
-    
+
     # Check if migrations need to be run
     if [ -d "drizzle" ] && [ "$(ls -A drizzle/*.sql 2>/dev/null)" ]; then
         echo "Found migration files, running migrations..."
@@ -32,7 +53,7 @@ run_migrations() {
     else
         echo "No migrations found or directory empty"
     fi
-    
+
     cd /app
 }
 
@@ -53,12 +74,10 @@ cd /app/apps/backend
 PORT=12009 node dist/index.js &
 BACKEND_PID=$!
 
-# Wait a moment for backend to start
-sleep 3
-
-# Check if backend is still running
-if ! kill -0 $BACKEND_PID 2>/dev/null; then
-    echo "❌ Backend server died! Exiting..."
+# Wait for the backend to actually bind + answer /health. Docker's stop-grace
+# + the trap below make this bounded even if it never comes up.
+if ! wait_for_port localhost 12009 90; then
+    echo "❌ Backend server failed to become healthy! Exiting..."
     exit 1
 fi
 echo "✅ Backend server started successfully (PID: $BACKEND_PID)"
@@ -69,12 +88,11 @@ cd /app/apps/frontend
 PORT=12008 pnpm start &
 FRONTEND_PID=$!
 
-# Wait a moment for frontend to start
-sleep 3
-
-# Check if frontend is still running
-if ! kill -0 $FRONTEND_PID 2>/dev/null; then
-    echo "❌ Frontend server died! Exiting..."
+# Wait for the frontend to bind. The Next proxy rewrites /health to the backend
+# (12009), so 12008 answering on its own assets is enough to prove the frontend
+# is up; the backend health is already gated above.
+if ! wait_for_port localhost 12008 90; then
+    echo "❌ Frontend server failed to become healthy! Exiting..."
     kill $BACKEND_PID 2>/dev/null
     exit 1
 fi

@@ -135,10 +135,16 @@ class BackgroundToolsSync {
       );
       if (toolsToSave.length > 0) {
         toolsSyncCache.update(serverUuid, toolNames);
-        await toolsRepository.syncTools({
-          tools: toolsToSave,
-          mcpServerUuid: serverUuid,
-        });
+        await toolsRepository.syncTools(
+          {
+            tools: toolsToSave,
+            mcpServerUuid: serverUuid,
+          },
+          // CRITICAL: pass the namespace so syncTools writes
+          // namespace_tool_mappings. Without it the DB fast path
+          // (readToolsForNamespace INNER JOIN) serves an EMPTY tool list.
+          namespaceUuid,
+        );
         logger.info(
           `[tools-sync] synced ${toolsToSave.length} tools for ${params.name} (${serverUuid})${hasChanged ? "" : " (reap-only, unchanged)"}`,
         );

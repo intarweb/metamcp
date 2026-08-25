@@ -138,7 +138,11 @@ ENV MCP_SPAWN_CONCURRENCY=4 \
 # of apps/backend (it runs `pnpm exec drizzle-kit migrate` at startup), so the
 # --prod prune keeps it linked into apps/backend/node_modules/.bin. --frozen-
 # lockfile pins the runner to the lockfile versions (no drift re-resolve).
-RUN CI=true pnpm install --prod --frozen-lockfile
+# The explicit add --prod below is belt-and-braces: if the lockfile doesn't
+# carry drizzle-kit as a prod dep, the entrypoint's `pnpm exec drizzle-kit
+# migrate` would fail with "Command drizzle-kit not found" and crash-loop.
+RUN CI=true pnpm install --prod --frozen-lockfile \
+    && cd apps/backend && CI=true pnpm add --prod drizzle-kit@0.31.1
 
 # Copy startup script
 COPY --chown=nextjs:nodejs docker-entrypoint.sh ./

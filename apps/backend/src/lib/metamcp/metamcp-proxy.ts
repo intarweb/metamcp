@@ -113,8 +113,10 @@ async function getSessionWithDeadline(
     namespaceUuid,
   );
   let timer: NodeJS.Timeout | undefined;
+  let timedOut = false;
   const timeout = new Promise<ConnectedClient | undefined>((resolve) => {
     timer = setTimeout(() => {
+      timedOut = true;
       logger.warn(
         `[fan-out] getSession deadline exceeded for server ${serverUuid} after ${timeoutMs}ms — returning as pending; spawn continues in background`,
       );
@@ -126,6 +128,26 @@ async function getSessionWithDeadline(
   } finally {
     if (timer) {
       clearTimeout(timer);
+    }
+    // The deadline only abandoned THIS request's wait, not the pool's spawn.
+    // If we won the race by timeout, the pool may still be connecting — and
+    // that in-flight spawn has no registration yet, so no pool cleanup path
+    // (session close / invalidate / LRU eviction) can ever reach it. Left
+    // alone, every slow cold spawn past the deadline leaks a process — the
+    // same footprint as the original pid-47 leak, but through the
+    // deadline-race door instead of the retry-catch door. Invalidate the
+    // server once the spawn settles so the abandoned connection is reaped
+    // instead of orphaned. It is a no-op if the spawn already finished and
+    // registered (that's the fast path, and session cleanup owns it).
+    if (timedOut) {
+      mcpServerPool
+        .invalidateServerConnection(sessionId, serverUuid)
+        .catch((error) => {
+          logger.error(
+            `Error invalidating timed-out session for server ${serverUuid} after deadline:`,
+            error,
+          );
+        });
     }
   }
 }

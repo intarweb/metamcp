@@ -125,8 +125,12 @@ export async function requestWithSessionRecovery<T>(
       })`,
     );
 
-    await opts.pool.invalidateServerConnection(opts.sessionId, opts.serverUuid);
+    // Set the cooldown BEFORE invalidating: two concurrent requests for the
+    // same dead server would otherwise both pass the cooldown check, both
+    // invalidate, and both spawn a fresh process — re-introducing the storm
+    // the cooldown exists to prevent. The second wave then sees the stamp.
     lastRecoveredAt.set(opts.serverUuid, Date.now());
+    await opts.pool.invalidateServerConnection(opts.sessionId, opts.serverUuid);
 
     const fresh = await opts.pool.getSession(
       opts.sessionId,
@@ -141,6 +145,22 @@ export async function requestWithSessionRecovery<T>(
     }
 
     opts.onFreshSession?.(fresh);
-    return await opts.attempt(fresh);
+    try {
+      return await opts.attempt(fresh);
+    } catch (retryError) {
+      // Mirror the proxy's call-tool fix (6a7b40d): a recovery retry that
+      // throws after registering the fresh session must clean it up, or it
+      // leaks in the active slot until the session closes. Keep the original
+      // error intact — a cleanup failure must not mask the real failure.
+      await opts.pool
+        .invalidateServerConnection(opts.sessionId, opts.serverUuid)
+        .catch((invalidateError) => {
+          logger.error(
+            `Error cleaning up leaked fresh session for server ${opts.serverUuid} after failed ${opts.operation} retry:`,
+            invalidateError,
+          );
+        });
+      throw retryError;
+    }
   }
 }
