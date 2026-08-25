@@ -102,12 +102,15 @@ export async function initializeIdleServers() {
       `Successfully converted ${Object.keys(allServerParams).length} MCP servers to ServerParameters format`,
     );
 
-    // Initialize idle sessions for the underlying MCP server pool with ALL servers
-    if (Object.keys(allServerParams).length > 0) {
+    // No boot prewarm. Servers are spawned lazily on the first real request
+    // (tools/call or a genuine tools-cache miss) so a server that is never
+    // called never holds a process. Set MCP_PREWARM_ON_BOOT=1 to restore the
+    // old prewarm-everything behavior.
+    if (process.env.MCP_PREWARM_ON_BOOT === "1") {
       const { mcpServerPool } = await import("./metamcp");
       await mcpServerPool.ensureIdleSessions(allServerParams);
       console.log(
-        "✅ Successfully initialized idle MCP server pool sessions for ALL servers",
+        "✅ Successfully initialized idle MCP server pool sessions for ALL servers (MCP_PREWARM_ON_BOOT=1)",
       );
     }
 

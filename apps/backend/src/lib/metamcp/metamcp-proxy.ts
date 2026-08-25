@@ -58,6 +58,7 @@ import {
   mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
 import { isBackendSessionLostError } from "./session-error";
+import { normalizeCallToolResult } from "./call-tool-result";
 import { parseToolName } from "./tool-name-parser";
 import { backgroundToolsSync } from "./background-tools-sync";
 import { circuitBreaker } from "./circuit-breaker";
@@ -190,7 +191,7 @@ export const createServer = async (
     request,
     context,
   ) => {
-    console.log(
+    logger.debug(
       "[DEBUG-TOOLS] 🔍 tools/list called for namespace:",
       namespaceUuid,
     );
@@ -238,6 +239,17 @@ export const createServer = async (
           }
         }
 
+        // Surface circuit-open servers as pending (DEGRADED surfacing): a
+        // tripped backend's tools are still served from DB (last-known) but
+        // the client sees the server needs a retry, not a hang.
+        for (const serverUuid of Object.keys(serverParams)) {
+          if (circuitBreaker.isOpen(serverUuid)) {
+            if (!pendingServers.includes(serverUuid)) {
+              pendingServers.push(serverUuid);
+            }
+          }
+        }
+
         const dbToolsWithName = dbTools.map((tool) => {
           const serverName = serverParams[tool.mcp_server_uuid]?.name || "";
           const toolName = `${sanitizeName(serverName)}__${tool.name}`;
@@ -251,7 +263,7 @@ export const createServer = async (
           };
         });
 
-        console.log(
+        logger.debug(
           `[DEBUG-TOOLS] ✅ tools/list served from DB in ${(performance.now() - startTime).toFixed(2)}ms (${dbToolsWithName.length} tools, ${pendingServers.length} pending)`,
         );
 
@@ -292,7 +304,7 @@ export const createServer = async (
     // We'll filter servers during processing after getting sessions to check actual MCP server names
     const allServerEntries = Object.entries(serverParams);
 
-    console.log(
+    logger.debug(
       `[DEBUG-TOOLS] 📋 Processing ${allServerEntries.length} servers`,
     );
 
@@ -309,7 +321,7 @@ export const createServer = async (
       poolStatus.active === 0 &&
       allServerEntries.length > 0
     ) {
-      console.log(
+      logger.debug(
         `[DEBUG-TOOLS] ⚠️ Cold start: 0 idle, 0 active sessions but ${allServerEntries.length} servers registered. Background prewarm started.`,
       );
       for (const [uuid] of allServerEntries) {
@@ -321,22 +333,22 @@ export const createServer = async (
         .ensureIdleSessions(serverParams, namespaceUuid)
         .then(() => {
           const afterStatus = mcpServerPool.getPoolStatus();
-          console.log(
+          logger.debug(
             `[DEBUG-TOOLS] ✅ Pool warmup complete: ${afterStatus.idle} idle, ${afterStatus.active} active`,
           );
         })
         .catch((error) => {
-          console.error("[DEBUG-TOOLS] ❌ Pool warmup failed:", error);
+          logger.error("[DEBUG-TOOLS] ❌ Pool warmup failed:", error);
         });
     }
 
     await Promise.allSettled(
       allServerEntries.map(async ([mcpServerUuid, params]) => {
-        console.log(`[DEBUG-TOOLS] 🔧 Server: ${params.name || mcpServerUuid}`);
+        logger.debug(`[DEBUG-TOOLS] 🔧 Server: ${params.name || mcpServerUuid}`);
 
         // Skip if we've already visited this server to prevent circular references
         if (visitedServers.has(mcpServerUuid)) {
-          console.log(
+          logger.debug(
             `[DEBUG-TOOLS] ⏭️  Skipping already visited: ${params.name}`,
           );
           return;
@@ -360,7 +372,7 @@ export const createServer = async (
           namespaceUuid,
         );
         if (!session) {
-          console.log(`[DEBUG-TOOLS] ❌ No session for: ${params.name}`);
+          logger.debug(`[DEBUG-TOOLS] ❌ No session for: ${params.name}`);
           // No pooled session and the pool couldn't create one — server is
           // ERROR-gated, connection-capped, deadline-exceeded, or unreachable.
           // Error level: this server is silently missing from the namespace's
@@ -463,7 +475,7 @@ export const createServer = async (
             },
           });
 
-          console.log(
+          logger.debug(
             `[DEBUG-TOOLS] ⏱️  Fetched ${allServerTools.length} tools from ${serverName} in ${(performance.now() - toolFetchStart).toFixed(2)}ms`,
           );
 
@@ -478,7 +490,7 @@ export const createServer = async (
               toolNames,
             );
 
-            console.log(
+            logger.debug(
               `[DEBUG-TOOLS] 🔍 Hash check for ${serverName}: ${hasChanged ? "CHANGED" : "UNCHANGED"}`,
             );
 
@@ -529,7 +541,7 @@ export const createServer = async (
     );
 
     const totalTime = performance.now() - startTime;
-    console.log(
+    logger.debug(
       `[DEBUG-TOOLS] ✅ tools/list completed in ${totalTime.toFixed(2)}ms, returning ${allTools.length} tools`,
     );
 
@@ -713,7 +725,11 @@ export const createServer = async (
       const result = (await callOnce(clientForTool)) as CallToolResult;
       // Circuit breaker: a successful call resets the backend's failure count.
       circuitBreaker.onSuccess(serverUuid);
-      return result;
+      // Normalize the backend's CallToolResult so a non-conforming shape never
+      // becomes a client-facing -32602 (zod hard-fail on the SDK shape). A
+      // backend's malformed output is a reason to degrade, not to break the
+      // call for the client.
+      return normalizeCallToolResult(result, serverUuid);
     } catch (error) {
       // Circuit breaker: a failed/timed-out call counts toward tripping.
       circuitBreaker.onFailure(serverUuid);
@@ -726,6 +742,15 @@ export const createServer = async (
           error,
         );
         throw error;
+      }
+
+      // Circuit breaker: a tripped backend must not be spawned into on every
+      // call. Surface a clean retryable error; the breaker's half-open probe
+      // lets a real request through once the cooldown elapses.
+      if (circuitBreaker.isOpen(serverUuid)) {
+        throw new Error(
+          `Backend server ${serverUuid} is circuit-open; skipping re-initialize for tool "${name}"`,
+        );
       }
 
       logger.warn(

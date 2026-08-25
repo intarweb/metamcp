@@ -91,6 +91,15 @@ export class McpServerPool {
   // parked session from holding a process forever.
   private readonly idleTimeoutMs: number;
 
+  // Health-loop recreate guard (see constructor). A failed health ping only
+  // recreates the idle session if the session hasn't served a request within
+  // the cooldown window AND has failed the ping this many consecutive times.
+  private readonly healthCheckRecreateCooldownMs: number;
+  private readonly healthCheckRecreateThreshold: number;
+  private readonly healthCheckFailures: Map<string, number>;
+  private readonly healthCheckTimeoutMs: number;
+  private readonly idleHealthPingEnabled: boolean;
+
   // Spawn concurrency gate for cold-start: cap how many cold server processes
   // may be connecting at once. Without it ensureIdleSessions() fires ~22
   // simultaneous spawns that blow past the SDK connect timeout (the
@@ -140,6 +149,34 @@ export class McpServerPool {
       process.env.MCP_SPAWN_CONCURRENCY || "4",
       10,
     );
+    // Recreate cooldown for the idle health loop: a session must be untouched
+    // for this long before a failed ping justifies replacing it. Prevents the
+    // health check from recreating a session mid-flight / false-negatively.
+    this.healthCheckRecreateCooldownMs = parseInt(
+      process.env.MCP_HEALTH_RECREATE_COOLDOWN_MS || `${30 * 1000}`,
+      10,
+    );
+    // Consecutive recreate guard: a server must fail the health ping this many
+    // consecutive times before we recreate its idle session. A single flaky
+    // ping (slow backend boot, gc pause) must not trigger a spawn.
+    this.healthCheckRecreateThreshold = parseInt(
+      process.env.MCP_HEALTH_RECREATE_THRESHOLD || "2",
+      10,
+    );
+    // Eager idle-health ping. Default OFF — with lazy spawn-on-demand the
+    // health loop's job is recycling idle-past-timeout sessions, not keeping
+    // the pool warm; a dead session is caught by the recovery retry on the
+    // next real call, not by a 60s timer. Set MCP_IDLE_HEALTH_PING=1 to keep
+    // the old behavior.
+    this.idleHealthPingEnabled =
+      (process.env.MCP_IDLE_HEALTH_PING || "0").trim().toLowerCase() === "1";
+    this.healthCheckTimeoutMs = parseInt(
+      process.env.MCP_HEALTH_CHECK_TIMEOUT_MS || "5000",
+      10,
+    );
+    // Consecutive ping failures per server (reset on a successful ping or a
+    // recreate). Drives the threshold above.
+    this.healthCheckFailures = new Map();
     this.maxConnectionsPerNamespace = maxConnectionsPerNamespace;
     this.startCleanupTimer();
     this.startHealthCheckTimer();
@@ -448,8 +485,8 @@ export class McpServerPool {
           `Converted idle session to active for server ${serverUuid}, session ${sessionId}`,
         );
 
-        // Create a new idle session to replace the one we just used (ASYNC - NON-BLOCKING)
-        this.createIdleSessionAsync(serverUuid, params, namespaceUuid);
+        // No replacement idle backfill — the next request recycles this
+        // session to idle via cleanupSession or spawns on demand.
 
         return idleClient;
       }
@@ -520,13 +557,6 @@ export class McpServerPool {
     logger.info(
       `Created new active session for server ${serverUuid}, session ${sessionId}`,
     );
-
-    // Only pre-warm idle pool for servers that don't require forwarded headers.
-    // Idle sessions are created without per-client headers, so they can't be
-    // reused when per-client header forwarding is configured.
-    if (!serverRequiresForwardedHeaders(params)) {
-      this.createIdleSessionAsync(serverUuid, params, namespaceUuid);
-    }
 
     return newClient;
   }
@@ -841,7 +871,9 @@ export class McpServerPool {
           `Recycled active connection for server ${serverUuid} to idle pool (session ${sessionId})`,
         );
       } else {
-        // Already have an idle session — destroy the extra
+        // Already have an idle session — destroy the extra. No replacement
+        // backfill: an extra active connection for a server we already hold
+        // idle is not a reason to spawn another process.
         try {
           await client.cleanup();
         } catch (error) {
@@ -1440,46 +1472,73 @@ export class McpServerPool {
   }
 
   /**
-   * Check health of idle sessions by pinging them.
-   * Dead sessions are cleaned up and recreated.
-   * Servers in ERROR state whose crash counters have been reset are retried.
+   * Check health of idle sessions.
+   *
+   * With lazy spawn-on-demand the health loop's job is NO LONGER to keep the
+   * pool warm — a dead session is caught by the recovery retry on the next
+   * real call, not by a 60s timer. So by default this loop only:
+   *   1. recycles idle sessions that have been untouched past idleTimeoutMs
+   *      (a parked process must not be held forever), and
+   *   2. runs the diagnostics accounting.
+   *
+   * The eager ping + recreate-on-false-negative that used to respawn a
+   * healthy-but-idle server every 60s is opt-in via MCP_IDLE_HEALTH_PING=1,
+   * and even then a session is only recreated if it hasn't served a request
+   * within the recreate cooldown AND has failed the ping the configured
+   * number of consecutive times — so a healthy session is never spawned
+   * "because a timer fired".
    */
   private async checkIdleSessionHealth(): Promise<void> {
     const serverUuids = Object.keys(this.idleSessions);
-    if (serverUuids.length === 0) {
-      return;
-    }
 
     for (const serverUuid of serverUuids) {
       const client = this.idleSessions[serverUuid];
       if (!client) continue;
 
+      // Per-server idle timeout: a parked idle session must not hold a
+      // process forever. Recycle if untouched past idleTimeoutMs.
+      if (
+        client.lastUsedAt &&
+        Date.now() - client.lastUsedAt > this.idleTimeoutMs
+      ) {
+        logger.info(
+          `Idle session for server ${serverUuid} idle past ${this.idleTimeoutMs}ms, closing...`,
+        );
+        await client.cleanup();
+        delete this.idleSessions[serverUuid];
+        // No recreate — the next real call spawns on demand.
+        this.healthCheckFailures.delete(serverUuid);
+        continue;
+      }
+
+      // Eager ping is opt-in and guarded: skip sessions that recently served
+      // a request (the caller just used it — it's alive), and only recreate
+      // after the cooldown + consecutive-failure threshold.
+      if (!this.idleHealthPingEnabled) continue;
+
+      if (
+        client.lastUsedAt &&
+        Date.now() - client.lastUsedAt < this.healthCheckRecreateCooldownMs
+      ) {
+        // Recently used — leave it alone.
+        continue;
+      }
+
       try {
-        // Per-server idle timeout: a parked idle session must not hold a
-        // process forever. Recycle if untouched past idleTimeoutMs.
-        if (
-          client.lastUsedAt &&
-          Date.now() - client.lastUsedAt > this.idleTimeoutMs
-        ) {
-          logger.info(
-            `Idle session for server ${serverUuid} idle past ${this.idleTimeoutMs}ms, recycling...`,
-          );
-          await client.cleanup();
-          delete this.idleSessions[serverUuid];
-          // Recreate so the slot stays warm for the next tools/list.
-          const params = this.serverParamsCache[serverUuid];
-          if (params) {
-            this.createIdleSessionAsync(serverUuid, params);
-          }
+        await client.client.ping({ timeout: this.healthCheckTimeoutMs });
+        this.healthCheckFailures.delete(serverUuid);
+      } catch {
+        const failures = (this.healthCheckFailures.get(serverUuid) || 0) + 1;
+        this.healthCheckFailures.set(serverUuid, failures);
+        logger.warn(
+          `Idle session health check failed for server ${serverUuid} (failure ${failures}/${this.healthCheckRecreateThreshold}); ` +
+            (failures >= this.healthCheckRecreateThreshold
+              ? `recreating after ${failures} consecutive failures`
+              : `not recreating yet — threshold not reached`),
+        );
+        if (failures < this.healthCheckRecreateThreshold) {
           continue;
         }
-
-        // Ping with a 5-second timeout
-        await client.client.ping({ timeout: 5000 });
-      } catch {
-        logger.warn(
-          `Idle session health check failed for server ${serverUuid}, recreating...`,
-        );
 
         // Clean up the dead session
         try {
@@ -1488,33 +1547,17 @@ export class McpServerPool {
           // Already dead, ignore cleanup errors
         }
         delete this.idleSessions[serverUuid];
+        this.healthCheckFailures.delete(serverUuid);
 
-        // Reset error state so we can retry
+        // Reset error state so a real request can retry. No background
+        // recreate here — the next real call spawns on demand.
         await serverErrorTracker.resetServerErrorState(serverUuid);
-
-        // Recreate if we have cached params
-        const params = this.serverParamsCache[serverUuid];
-        if (params) {
-          this.createIdleSessionAsync(serverUuid, params);
-        }
       }
     }
 
-    // Also check for servers in ERROR state that have cached params but no idle session.
-    // If they were reset (e.g., on startup), we should try to recreate them.
-    for (const [serverUuid, params] of Object.entries(this.serverParamsCache)) {
-      if (
-        !this.idleSessions[serverUuid] &&
-        !this.creatingIdleSessions.has(serverUuid)
-      ) {
-        const isError =
-          await serverErrorTracker.isServerInErrorState(serverUuid);
-        if (!isError) {
-          // Not in error and no idle session - try to create one
-          this.createIdleSessionAsync(serverUuid, params);
-        }
-      }
-    }
+    // No background backfill. A server with cached params but no idle slot is
+    // not spawned here — a session is created only when a real request needs
+    // it (lazy spawn-on-demand).
 
     // Diagnostics: periodic pool accounting so the leak/storm footprint is
     // visible in the logs without needing a health probe.
