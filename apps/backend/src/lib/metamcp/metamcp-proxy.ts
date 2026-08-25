@@ -3,6 +3,7 @@ import { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import {
   CallToolRequestSchema,
   CallToolResult,
+  CallToolResultSchema,
   CompatibilityCallToolResultSchema,
   GetPromptRequestSchema,
   GetPromptResultSchema,
@@ -22,6 +23,7 @@ import {
   ResourceTemplate,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
 import logger from "@/utils/logger";
 
@@ -707,8 +709,15 @@ export const createServer = async (
       maxTotalTimeout,
     };
 
-    const callOnce = (session: ConnectedClient) =>
-      session.client.request(
+    // Fetch the backend result with a PERMISSIVE schema (z.unknown) so the SDK
+    // returns the raw payload instead of hard-failing -32602 on a malformed
+    // `content` shape during validation. We normalize to the SDK shape after,
+    // and only then validate — so a backend's malformed output never becomes a
+    // client-facing error.
+    const callOnce = async (
+      session: ConnectedClient,
+    ): Promise<CallToolResult> => {
+      const raw = await session.client.request(
         {
           method: "tools/call",
           params: {
@@ -717,19 +726,33 @@ export const createServer = async (
             _meta: request.params._meta,
           },
         },
-        CompatibilityCallToolResultSchema,
+        z.unknown(),
         mcpRequestOptions,
       );
-
-    try {
-      const result = (await callOnce(clientForTool)) as CallToolResult;
-      // Circuit breaker: a successful call resets the backend's failure count.
-      circuitBreaker.onSuccess(serverUuid);
       // Normalize the backend's CallToolResult so a non-conforming shape never
       // becomes a client-facing -32602 (zod hard-fail on the SDK shape). A
       // backend's malformed output is a reason to degrade, not to break the
       // call for the client.
-      return normalizeCallToolResult(result, serverUuid);
+      const result = normalizeCallToolResult(raw as CallToolResult, serverUuid);
+      // Validate the normalized result: if it STILL doesn't conform (e.g. the
+      // backend returned a fundamentally non-result object), surface a clean
+      // retryable error rather than a raw zod dump.
+      const parsed = CallToolResultSchema.safeParse(result);
+      if (!parsed.success) {
+        logger.error(
+          `[call-tool] backend ${serverUuid} returned an unshapable CallToolResult for tool "${name}"; returning clean error`,
+        );
+        throw new Error(
+          `Backend ${serverUuid} returned an invalid tools/call result for "${name}"`,
+        );
+      }
+      return parsed.data;
+    };
+
+    try {
+      // Circuit breaker: a successful call resets the backend's failure count.
+      circuitBreaker.onSuccess(serverUuid);
+      return await callOnce(clientForTool);
     } catch (error) {
       // Circuit breaker: a failed/timed-out call counts toward tripping.
       circuitBreaker.onFailure(serverUuid);

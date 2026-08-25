@@ -1,4 +1,7 @@
-import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolResult,
+  CallToolResultSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 
 import { normalizeCallToolResult } from "./call-tool-result";
@@ -74,5 +77,18 @@ describe("normalizeCallToolResult", () => {
     const normalized = normalizeCallToolResult(result, "server-1");
     expect(normalized.content).toHaveLength(1);
     expect(normalized.content[0]).toMatchObject({ type: "text", text: "" });
+  });
+
+  it("the normalized result passes CallToolResultSchema (no -32602 after normalization)", () => {
+    // The pocket-id case: content[0] is { foo: "bar" } — a raw backend result
+    // that hard-fails the SDK schema with -32602 if not normalized first.
+    const raw = {
+      content: [{ foo: "bar" }],
+    } as unknown as CallToolResult;
+
+    const normalized = normalizeCallToolResult(raw, "server-1");
+    // This is the exact check the proxy now runs after normalizing; a raw
+    // backend result would have failed here.
+    expect(CallToolResultSchema.safeParse(normalized).success).toBe(true);
   });
 });
