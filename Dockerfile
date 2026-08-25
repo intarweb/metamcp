@@ -142,7 +142,15 @@ ENV MCP_SPAWN_CONCURRENCY=4 \
 # carry drizzle-kit as a prod dep, the entrypoint's `pnpm exec drizzle-kit
 # migrate` would fail with "Command drizzle-kit not found" and crash-loop.
 RUN CI=true pnpm install --prod --frozen-lockfile \
-    && cd apps/backend && CI=true pnpm add --prod drizzle-kit@0.31.1
+    && cd apps/backend && CI=true pnpm add --prod drizzle-kit@0.31.1 \
+    # The Next proxy-request timeout patch must be re-applied here: this stage
+    # runs its OWN pnpm install (--prod), which links the store with the peer
+    # deps the runner resolves (react 19.x could float to a different minor than
+    # the builder's). The builder-stage sed only patched the builder's store, so
+    # the static-path sed below would miss and fail the build. find-based + fail-
+    # open so it survives any peer/store drift.
+    && find node_modules/.pnpm -path "*next/dist/server/lib/router-utils/proxy-request.js" -exec sed -i "s/30000/600000/" {} + || true \
+    && find node_modules/.pnpm -path "*next/dist/esm/server/lib/router-utils/proxy-request.js" -exec sed -i "s/30000/600000/" {} + || true
 
 # Copy startup script
 COPY --chown=nextjs:nodejs docker-entrypoint.sh ./
