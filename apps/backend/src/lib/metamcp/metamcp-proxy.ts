@@ -817,6 +817,21 @@ export const createServer = async (
           } after session re-initialize:`,
           retryError,
         );
+        // The retry's fresh spawn is registered in the pool but will never be
+        // recycled or evicted if the caller already gave up (its request timed
+        // out while we awaited the fresh connect). Invalidate + kill it so a
+        // failed recovery does not leak a spawned backend process forever
+        // (the pid-47 orphan pileup that pushed the container to 8.45GB/8GB).
+        // The invalidation cascades across every slot for this serverUuid and
+        // is idempotent — safe if another request already adopted this session.
+        await mcpServerPool
+          .invalidateServerConnection(sessionId, serverUuid)
+          .catch((invalidateError) => {
+            logger.error(
+              `Error cleaning up leaked fresh session for server ${serverUuid} after failed re-initialize:`,
+              invalidateError,
+            );
+          });
         throw retryError;
       }
     }
