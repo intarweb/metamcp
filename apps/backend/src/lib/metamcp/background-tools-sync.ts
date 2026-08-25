@@ -5,6 +5,7 @@ import logger from "@/utils/logger";
 
 import { toolsRepository } from "../../db/repositories";
 import { configService } from "../config.service";
+import { circuitBreaker } from "./circuit-breaker";
 import { getMcpServers } from "./fetch-metamcp";
 import { filterOutOverrideTools } from "./override-filter";
 import { toolsSyncCache } from "./tools-sync-cache";
@@ -91,6 +92,9 @@ class BackgroundToolsSync {
         await Promise.allSettled(
           entries.map(async ([uuid, params]) => {
             if (this.isFresh(uuid)) return;
+            // Skip tripped servers — don't hammer a backend the circuit
+            // breaker has opened.
+            if (circuitBreaker.isOpen(uuid)) return;
             await this.syncServer(uuid, params, ns);
           }),
         );
@@ -113,7 +117,7 @@ class BackgroundToolsSync {
     if (this.inFlight.has(serverUuid)) return;
     this.inFlight.add(serverUuid);
     try {
-      const timeout = await configService.getMcpTimeout();
+      const timeout = await configService.getMcpTimeoutForNamespace(namespaceUuid);
       const tools = await this.fetchToolsForServer(params, timeout);
       const toolNames = tools.map((t) => t.name);
       const hasChanged = toolsSyncCache.hasChanged(serverUuid, toolNames);
