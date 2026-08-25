@@ -48,9 +48,8 @@ COPY . .
 # Build all packages and apps
 RUN pnpm build
 
-RUN sed -i -e "s/30000/600000/" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/server/lib/router-utils/proxy-request.js" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/esm/server/lib/router-utils/proxy-request.js"
+RUN find node_modules/.pnpm -path "*next/dist/server/lib/router-utils/proxy-request.js" -exec sed -i "s/30000/600000/" {} + || true && \
+    find node_modules/.pnpm -path "*next/dist/esm/server/lib/router-utils/proxy-request.js" -exec sed -i "s/30000/600000/" {} + || true
 
 # Production runner stage
 FROM base AS runner
