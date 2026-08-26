@@ -471,16 +471,23 @@ async function installGitWith(
       );
       continue;
     }
-    const name = repo.split("/").pop()?.replace(/\.git$/, "") || "git-pkg";
+    // The `git+` prefix is the npm-install *scheme marker* ("this is a git
+    // dependency"), NOT part of the URL. Passing it to `git clone` makes git
+    // try the `remote-git+https` helper and fail (exit 128) — the mcp-assistant
+    // ENOENT root cause. Strip it so the URL is a plain https:// or ssh:// that
+    // `git clone` accepts directly.
+    const cloneUrl = repo.replace(/^git\+/, "");
+    const name = cloneUrl.split("/").pop()?.replace(/\.git$/, "") || "git-pkg";
     const dest = `${homedir()}/.local/src/${name}`;
-    logger.info(`Starting package pre-install: ${name} (git ${repo})`);
+    logger.info(`Starting package pre-install: ${name} (git ${cloneUrl})`);
 
     try {
       const binExists = (await run("test", ["-x", `${binDir}/${name}`])).code === 0;
       const destExists = (await run("test", ["-d", dest])).code === 0;
       if (!binExists || !destExists) {
-        // Clone shallow (fast + cache-friendly).
-        const clone = await run("git", ["clone", "--depth", "1", repo, dest]);
+        // Clone shallow (fast + cache-friendly). `cloneUrl` has the `git+`
+        // marker stripped — see the loop top.
+        const clone = await run("git", ["clone", "--depth", "1", cloneUrl, dest]);
         if (clone.code !== 0) {
           logger.warn(
             `Failed: ${name} (git clone ${clone.code}) — ${clone.output.trim().slice(0, 200)}. Spawns will fall back to on-demand build.`,

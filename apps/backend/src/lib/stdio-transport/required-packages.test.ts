@@ -351,9 +351,11 @@ describe("installRequiredPackages", () => {
     expect(gitSpawn).toBeDefined();
     const cloneArgs = gitSpawn?.args ?? [];
     expect(cloneArgs[0]).toBe("clone");
-    // `git clone --depth 1 <repo> <dest>` — the URL must NOT end in `|`, and
-    // the destination must be the SANITIZED name — no trailing `|`.
-    expect(cloneArgs[3]).toBe("git+https://github.com/netbirdio/netbird-mcp");
+    // `git clone --depth 1 <repo> <dest>` — the URL must NOT end in `|`, the
+    // `git+` scheme marker must be stripped so `git clone` accepts it directly
+    // (git rejects `git+https://` via the remote-git+https helper), and the
+    // destination must be the SANITIZED name — no trailing `|`.
+    expect(cloneArgs[3]).toBe("https://github.com/netbirdio/netbird-mcp");
     expect(cloneArgs[4]).toBe("/home/test/.local/src/netbird-mcp");
   });
 
