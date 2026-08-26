@@ -86,6 +86,13 @@ RUN adduser --system --uid 1001 --home /home/nextjs nextjs && \
     mkdir -p /home/nextjs/.cache/node/corepack /home/nextjs/.cache/uv && \
     chown -R nextjs:nodejs /home/nextjs
 
+# Required-package install TARGET: pin the npm global prefix to the per-user
+# ~/.npm-global (the image default prefix is /usr, which is on the read-only
+# overlay — `npm install -g` there would re-resolve the whole tree on every
+# boot and never persist). Image-level so it is ALWAYS present, even when the
+# operator's runtime env omits it.
+ENV REQUIRED_PACKAGES_NPM_PREFIX=/home/nextjs/.npm-global
+
 # Copy built applications
 COPY --from=builder --chown=nextjs:nodejs /app/apps/frontend/.next ./apps/frontend/.next
 COPY --from=builder --chown=nextjs:nodejs /app/apps/frontend/package.json ./apps/frontend/
@@ -122,6 +129,7 @@ ENV MCP_SPAWN_CONCURRENCY=4 \
 #   REQUIRED_PACKAGES_GIT_NPM="git+https://…#<subdir>|#<cmd>|#<args>"  # git+npm build
 #   REQUIRED_PACKAGES_BUN_GIT="git+https://…#<subdir>|#<cmd>|#<args>"  # git+bun build
 #   REQUIRED_PACKAGES_CONCURRENCY=2
+#   REQUIRED_PACKAGES_NPM_PREFIX=$HOME/.npm-global  # pinned at image level above
 # Each package logs "Starting package pre-install: <pkg>" → "Pre-installed
 # <pkg>" / "Failed: <reason>". Packages install into the per-user cache dirs
 # (/home/nextjs/.npm-global, /home/nextjs/.cache/uv, /home/nextjs/.bun) which

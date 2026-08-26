@@ -10,6 +10,7 @@ const mockState = vi.hoisted(() => {
   const spawned: Array<{
     cmd: string;
     args: string[];
+    env: Record<string, string>;
     proc: {
       stdin: null;
       stdout: NodeJS.EventEmitter;
@@ -18,12 +19,13 @@ const mockState = vi.hoisted(() => {
     };
   }> = [];
   let exitCode = 0;
-  // The REAL default implementation — record every spawn with its args and
+  let statUid: number | undefined;
+  // The REAL default implementation — record every spawn with its args/env and
   // close with the exit code captured AT SPAWN TIME on the next tick.
   const defaultImpl = (
     cmd: string,
     args: string[],
-    _opts: unknown,
+    opts: unknown,
   ): {
     stdin: null;
     stdout: NodeJS.EventEmitter;
@@ -39,10 +41,30 @@ const mockState = vi.hoisted(() => {
     proc.stdin = null;
     proc.stdout = new EventEmitter();
     proc.stderr = new EventEmitter();
-    spawned.push({ cmd, args, proc });
+    const env =
+      typeof opts === "object" && opts !== null && "env" in opts
+        ? (opts as { env?: Record<string, string> }).env ?? {}
+        : {};
+    spawned.push({ cmd, args, env, proc });
     const code = exitCode;
     setImmediate(() => proc.emit("close", code));
     return proc;
+  };
+  // fs mock fns created in the vi.mock factory below must be assertable from
+  // tests — hold them on mockState so both share ONE instance.
+  const fsMocks: {
+    mkdirSync: ReturnType<typeof vi.fn>;
+    chownSync: ReturnType<typeof vi.fn>;
+    accessSync: ReturnType<typeof vi.fn>;
+    statSync: ReturnType<typeof vi.fn>;
+  } = {
+    mkdirSync: vi.fn(),
+    chownSync: vi.fn(),
+    accessSync: vi.fn(),
+    statSync: vi.fn(() => ({
+      uid: statUid ?? process.getuid?.() ?? 0,
+      gid: statUid ?? process.getgid?.() ?? 0,
+    })),
   };
   return {
     spawn: vi.fn(defaultImpl),
@@ -58,6 +80,10 @@ const mockState = vi.hoisted(() => {
     __setExistingFiles: (paths: string[]) => {
       existingFiles = new Set(paths);
     },
+    __setStatUid: (uid: number | undefined) => {
+      statUid = uid;
+    },
+    __fsMocks: fsMocks,
   };
 });
 
@@ -72,6 +98,7 @@ vi.mock("node:os", () => ({
 // Never delete a real cache during tests.
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
+  const fsMocks = (mockState as any).__fsMocks;
   return {
     ...actual,
     rmSync: vi.fn(),
@@ -81,13 +108,27 @@ vi.mock("node:fs", async (importOriginal) => {
       const current = (mockState as any).__existingFiles as Set<string>;
       return current.has(String(p));
     },
+    // The NFS ownership self-heal mkdir/chown/access must not touch the real
+    // filesystem under the mocked homedir (/home/test) — no-op them. statSync
+    // defaults to the current uid (dir owned by us → chown skipped); a test can
+    // override via __setStatUid to simulate a root-owned NFS dir. The vi.fn()
+    // instances live on mockState so tests can assert them directly.
+    mkdirSync: fsMocks.mkdirSync,
+    chownSync: fsMocks.chownSync,
+    accessSync: fsMocks.accessSync,
+    statSync: fsMocks.statSync,
   };
 });
 
 import { rmSync } from "node:fs";
 
 import { resetHealedKindsForTest } from "./cache-health";
-import { installRequiredPackages } from "./required-packages";
+import {
+  ensureCacheDirsWritable,
+  installRequiredPackages,
+  parseGitSpec,
+  sanitizeGitRepo,
+} from "./required-packages";
 
 beforeEach(() => {
   for (const key of [
@@ -116,6 +157,9 @@ beforeEach(() => {
   // Fresh home by default: nothing is installed yet, so the skip-if-present
   // guard never fires and every group runs its batched install.
   mockState.__setExistingFiles([]);
+  // Cache dirs are "ours" by default (chown skipped); a test overrides this to
+  // simulate a root-owned NFS dir.
+  mockState.__setStatUid(undefined);
 });
 
 afterEach(() => {
@@ -256,16 +300,148 @@ describe("installRequiredPackages", () => {
     expect(mockState.__spawned.some((s) => s.cmd === "mkdir")).toBe(true);
   });
 
-  it("installs bun-compiled git packages inline (bun build --compile)", async () => {
+  it("installs bun-compiled git packages inline (bun install deps THEN bun build --compile)", async () => {
     process.env.REQUIRED_PACKAGES_BUN_GIT =
       "git+https://github.com/nikkomiu/pocketid-mcp|#|#|#";
 
     await installRequiredPackages();
 
     const bun = mockState.__spawned.filter((s) => s.cmd === "bun");
-    expect(bun.some((s) => s.args[0] === "build" && s.args[2] === "--compile")).toBe(
-      true,
+    const installIdx = bun.findIndex((s) => s.args[0] === "install");
+    const buildIdx = bun.findIndex(
+      (s) => s.args[0] === "build" && s.args[2] === "--compile",
     );
+    // bun install MUST run before bun build — a fresh clone has no
+    // node_modules and `bun build` alone fails to resolve @modelcontextprotocol/sdk.
+    expect(installIdx).toBeGreaterThanOrEqual(0);
+    expect(buildIdx).toBeGreaterThan(installIdx);
+    expect(bun[installIdx].args[0]).toBe("install");
+    expect(bun[buildIdx].args).toEqual([
+      "build",
+      "src/index.ts",
+      "--compile",
+      "--outfile",
+      "/home/test/.local/bin/pocketid-mcp",
+    ]);
+  });
+
+  it("sanitizes a trailing-| git spec so the clone URL + dest name have no trailing pipe", async () => {
+    // A `git+https://…|` spec (the lone trailing pipe from a `|#|#|#`-style
+    // entry when the parts are empty) leaks the `|` into the repo → dest
+    // `~/.local/src/netbird-mcp|` → `git clone` exit 128.
+    process.env.REQUIRED_PACKAGES_GIT_NPM =
+      "git+https://github.com/netbirdio/netbird-mcp|#|#|#";
+
+    // Force the `test -x` / `test -d` probes to fail so the clone path runs.
+    const originalImpl = mockState.spawn.getMockImplementation();
+    mockState.spawn.mockImplementation((cmd, args, opts) => {
+      if (!originalImpl) {
+        throw new Error("expected the real spawn implementation");
+      }
+      const proc = originalImpl(cmd, args, opts);
+      if (cmd === "test") {
+        process.nextTick(() => proc.emit("close", 1));
+      }
+      return proc;
+    });
+
+    await installRequiredPackages();
+
+    const gitSpawn = mockState.__spawned.find((s) => s.cmd === "git");
+    expect(gitSpawn).toBeDefined();
+    const cloneArgs = gitSpawn?.args ?? [];
+    expect(cloneArgs[0]).toBe("clone");
+    // `git clone --depth 1 <repo> <dest>` — the URL must NOT end in `|`, and
+    // the destination must be the SANITIZED name — no trailing `|`.
+    expect(cloneArgs[3]).toBe("git+https://github.com/netbirdio/netbird-mcp");
+    expect(cloneArgs[4]).toBe("/home/test/.local/src/netbird-mcp");
+  });
+
+  it("parseGitSpec strips a lone trailing pipe + whitespace from the repo and validates the scheme", () => {
+    // Trailing `|` from a `|#|#|#` entry (the real netbird-mcp failure).
+    expect(
+      parseGitSpec("git+https://github.com/netbirdio/netbird-mcp|"),
+    ).toEqual({
+      repo: "git+https://github.com/netbirdio/netbird-mcp",
+      subdir: "",
+      cmd: "",
+      args: [],
+    });
+    // Explicit `|#` parts are preserved.
+    expect(
+      parseGitSpec("git+https://github.com/a/b#pkg|#sub|#npm|#install --no-audit"),
+    ).toEqual({
+      repo: "git+https://github.com/a/b#pkg",
+      subdir: "sub",
+      cmd: "npm",
+      args: ["install", "--no-audit"],
+    });
+  });
+
+  it("sanitizeGitRepo rejects a repo that does not look like git+https://…", () => {
+    expect(sanitizeGitRepo("github.com/a/b")).toBeNull();
+    expect(sanitizeGitRepo("https://github.com/a/b")).toBeNull();
+    expect(sanitizeGitRepo("git+ssh://git@github.com/a/b")).toBe(
+      "git+ssh://git@github.com/a/b",
+    );
+  });
+
+  it("a malformed git spec (no git+ scheme) is skipped loudly without cloning", async () => {
+    process.env.REQUIRED_PACKAGES_GIT_NPM = "not-a-repo-url";
+
+    await installRequiredPackages();
+
+    expect(mockState.__spawned.some((s) => s.cmd === "git")).toBe(false);
+  });
+
+  it("ensureCacheDirsWritable chowns a root-owned cache dir to the running user (NFS self-heal)", () => {
+    // Simulate an NFS mount that came up root-owned: stat reports uid 0.
+    mockState.__setStatUid(0);
+    const { mkdirSync, chownSync } = mockState.__fsMocks;
+    vi.mocked(mkdirSync).mockClear();
+    vi.mocked(chownSync).mockClear();
+
+    ensureCacheDirsWritable(["/home/test/.npm-global"]);
+
+    expect(mkdirSync).toHaveBeenCalledWith("/home/test/.npm-global", {
+      recursive: true,
+    });
+    // chown to the RUNNING uid (not root) — self-heal, not privilege grab.
+    expect(chownSync).toHaveBeenCalledWith(
+      "/home/test/.npm-global",
+      process.getuid?.() ?? -1,
+      process.getgid?.() ?? -1,
+    );
+  });
+
+  it("forces devDependencies into git-npm installs (npm_config_include=dev) so tsc/tsx survive NODE_ENV=production", async () => {
+    process.env.REQUIRED_PACKAGES_GIT_NPM =
+      "git+https://github.com/netbirdio/netbird-mcp|#|#|#";
+    process.env.NODE_ENV = "production";
+
+    // Force the `test -x` / `test -d` probes to fail so the clone path runs.
+    const originalImpl = mockState.spawn.getMockImplementation();
+    mockState.spawn.mockImplementation((cmd, args, opts) => {
+      if (!originalImpl) {
+        throw new Error("expected the real spawn implementation");
+      }
+      const proc = originalImpl(cmd, args, opts);
+      if (cmd === "test") {
+        process.nextTick(() => proc.emit("close", 1));
+      }
+      return proc;
+    });
+
+    await installRequiredPackages();
+
+    const npmInstall = mockState.__spawned.find(
+      (s) => s.cmd === "npm" && s.args[0] === "install",
+    );
+    expect(npmInstall).toBeDefined();
+    // The install env MUST force devDeps + a dev context so typescript/tsc are
+    // present for `npm run build` even when the container runs NODE_ENV=production.
+    expect(npmInstall?.env.npm_config_include).toBe("dev");
+    expect(npmInstall?.env.NODE_ENV).toBe("development");
   });
 
   it("skips the install entirely when every package is already present (warm-cache no-op)", async () => {

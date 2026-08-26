@@ -1,5 +1,12 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import {
+  accessSync,
+  chownSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -35,7 +42,15 @@ import {
  * (~/.npm-global, ~/.cache/uv, ~/.bun) which are both volume-mountable AND
  * persist across container restarts without a volume — the install phase is
  * what makes a fresh container deterministic (rule: once installed, a package
- * is NOT installed again).
+ * is NOT installed again). The image exports
+ * REQUIRED_PACKAGES_NPM_PREFIX=$HOME/.npm-global so a missing env var can
+ * never silently rebuild the whole tree into the image default prefix (/usr).
+ *
+ * NFS-subpath ownership: when the per-user cache dirs are NFS mounts they can
+ * come up root-owned while the runner is UID 1001. Before installing, the
+ * phase verifies each dir exists + is writable and attempts a chown to the
+ * running user, logging LOUDLY when it cannot — a silently-failing install is
+ * worse than a visible one.
  *
  * PERF: the install phase is one BATCHED installer invocation PER GROUP, NOT one
  * invocation per package. npm install -g re-resolves + re-reconciles the ENTIRE
@@ -83,14 +98,34 @@ function parseArgsList(envValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-/** Split a `git+https://…` spec into its `|#`-separated parts. */
-function parseGitSpec(spec: string): {
+/**
+ * Sanitize the repo URL parsed from a `|#`-separated git spec. A spec like
+ * `git+https://…#|#|#` leaves a lone trailing `|` (or `|#` padding) after the
+ * split — `git clone git+https://…repo|` fails with exit 128 and the dest name
+ * becomes `repo|`. Trim whitespace, strip a lone trailing `|` (the pad that
+ * survives when the optional `|#`-parts are empty), and refuse a repo that does
+ * not look like a `git+https://…` URL so a malformed spec can never reach
+ * `git clone` with a mangled URL/dest.
+ */
+export function sanitizeGitRepo(repo: string): string | null {
+  const trimmed = repo.trim().replace(/\|+$/, "");
+  if (!trimmed.startsWith("git+https://") && !trimmed.startsWith("git+ssh://")) {
+    return null;
+  }
+  return trimmed;
+}
+
+/** Split a `git+https://…` spec into its `|#`-separated parts. The repo is
+ * sanitized (trailing-`|`/whitespace stripped, `git+https://`/`git+ssh://`
+ * validated) so the dest name is ALWAYS derived from a clean URL. */
+export function parseGitSpec(spec: string): {
   repo: string;
   subdir: string;
   cmd: string;
   args: string[];
 } {
-  const [repo, ...rest] = spec.split("|#");
+  const [rawRepo, ...rest] = spec.split("|#");
+  const repo = sanitizeGitRepo(rawRepo) ?? rawRepo.trim().replace(/\|+$/, "");
   const subdir = rest[0] ?? "";
   const cmd = rest[1] ?? "";
   const args = rest[2] ? rest[2].split(/[\s,]+/).filter(Boolean) : [];
@@ -349,11 +384,62 @@ async function installWith(
 }
 
 /**
+ * NFS-mounted per-user cache dirs (~/.local, ~/.npm-global, ~/.npm, ~/.bun)
+ * can come up root-owned — the runner (UID 1001, `nextjs`) then cannot write,
+ * and every install silently fails. mkdir -p + attempt chown to the running
+ * user + verify writability, logging LOUDLY on failure (chown on NFS needs
+ * root privileges the process may not have; when it can't fix ownership the
+ * install MUST fail loudly, not silently). This only ADDS ownership — an
+ * existing user-owned dir is left untouched.
+ */
+export function ensureCacheDirsWritable(dirs: string[]): void {
+  for (const dir of dirs) {
+    try {
+      mkdirSync(dir, { recursive: true });
+      let uid = -1;
+      let gid = -1;
+      try {
+        const stat = statSync(dir);
+        if (stat.uid === process.getuid?.()) {
+          continue; // Already ours — leave it alone.
+        }
+        uid = process.getuid?.() ?? -1;
+        gid = process.getgid?.() ?? -1;
+      } catch {
+        // stat failed (unlikely post-mkdir); fall through to chown attempt.
+      }
+      if (uid >= 0 && gid >= 0) {
+        try {
+          chownSync(dir, uid, gid);
+        } catch (error) {
+          logger.error(
+            `[required-packages] cache dir ${dir} is not owned by the running user and could not be chown'd (${error instanceof Error ? error.message : String(error)}). Package installs into it will FAIL — fix the mount ownership (e.g. re-mount the NFS share with root_squash off, or chown -R <uid>:<gid> ${dir} on the host).`,
+          );
+          continue;
+        }
+      }
+      try {
+        accessSync(dir, constants.W_OK);
+      } catch (error) {
+        logger.error(
+          `[required-packages] cache dir ${dir} is NOT writable by the running user (${error instanceof Error ? error.message : String(error)}). Package installs into it will FAIL silently.`,
+        );
+      }
+    } catch (error) {
+      logger.error(
+        `[required-packages] could not create/verify cache dir ${dir}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}
+
+/**
  * Install a git-based package INLINE (no sidecar): clone, install deps, build,
  * leaving a ready-to-run binary/entry at ~/.local/bin/<name>. Supports:
  *  - npm-built servers (e.g. netbirdio/netbird-mcp: `npm i && npm run build` →
  *    node dist/bin/stdio.js)
- *  - bun-compiled servers (e.g. nikkomiu/pocketid-mcp: `bun build … --compile`)
+ *  - bun-compiled servers (e.g. nikkomiu/pocketid-mcp: `bun install && bun build
+ *    … --compile`)
  *  - bare binaries (e.g. `go install`)
  *
  * Spec format: `git+https://…|#<subdir>|#<cmd>|#<arg1 arg2>` — the `|#`-parts
@@ -368,9 +454,23 @@ async function installGitWith(
   const binDir = `${homedir()}/.local/bin`;
   // Ensure the bin dir exists (mkdir -p) — created lazily on first git install.
   await run("mkdir", ["-p", binDir]);
+  // Self-heal the per-user cache dirs this group writes into (NFS ownership).
+  ensureCacheDirsWritable([
+    binDir,
+    `${homedir()}/.local/src`,
+    `${homedir()}/.npm`,
+    `${homedir()}/.npm-global`,
+    `${homedir()}/.bun`,
+  ]);
 
   for (const spec of packages) {
     const { repo, subdir, cmd: specCmd, args } = parseGitSpec(spec);
+    if (!repo.startsWith("git+https://") && !repo.startsWith("git+ssh://")) {
+      logger.warn(
+        `Failed: git spec "${spec}" — repo URL does not look like git+https://… (or git+ssh://…). Spawns will fall back to on-demand build.`,
+      );
+      continue;
+    }
     const name = repo.split("/").pop()?.replace(/\.git$/, "") || "git-pkg";
     const dest = `${homedir()}/.local/src/${name}`;
     logger.info(`Starting package pre-install: ${name} (git ${repo})`);
@@ -393,8 +493,24 @@ async function installGitWith(
       const cmd = specCmd || defaultCmd;
       // npm group: install deps then build (the package ships a `build`
       // script, e.g. netbird-mcp `tsc -p tsconfig.json` → dist/bin/stdio.js).
-      // bun group: `bun build --compile` → a single binary.
+      // bun group: `bun install` deps then `bun build --compile` → a single
+      // binary.
       if (defaultCmd === "bun" && args.length === 0) {
+        // A fresh clone has NO node_modules — `bun build src/index.ts` would
+        // fail with `Could not resolve: "@modelcontextprotocol/sdk"` (the
+        // pocketid-mcp failure). Install deps first.
+        const bunInstall = await run(
+          cmd,
+          ["install", "--no-progress"],
+          {},
+          cwd,
+        );
+        if (bunInstall.code !== 0) {
+          logger.warn(
+            `Failed: ${name} (bun install ${bunInstall.code}) — ${bunInstall.output.trim().slice(0, 300)}. Spawns will fall back to on-demand build.`,
+          );
+          continue;
+        }
         const build = await run(
           cmd,
           ["build", "src/index.ts", "--compile", "--outfile", `${binDir}/${name}`],
@@ -408,10 +524,34 @@ async function installGitWith(
           continue;
         }
       } else {
+        // npm-flavored command: `npm`, a qualified path (`/usr/bin/npm`), or a
+        // spec-provided npm invocation. The git-npm group is npm-only, so a
+        // non-npm command falls through to the generic install env.
+        const isNpm =
+          cmd === "npm" || /(^|\/)npm(\.js)?$/.test(cmd) || cmd === "pnpm";
+        const installEnv: Record<string, string> = isNpm
+          ? {
+              // The container runs NODE_ENV=production, which makes `npm
+              // install` SKIP devDependencies — a git-npm server whose build
+              // needs typescript/tsc (netbird-mcp) then fails `npm run build`
+              // with "tsc: not found". Force devDeps into the install so the
+              // build step works out of the box, and pin NODE_ENV=development
+              // so a dependency that keys on NODE_ENV sees a build context.
+              npm_config_include: "dev",
+              NODE_ENV: "development",
+              // Point the install at the same per-user prefix the runtime
+              // resolves (spawns + the global install phase), so the clone's
+              // `node_modules/.bin` is complete and the built binary resolves
+              // consistently with the rest of the pool.
+              npm_config_prefix:
+                process.env.REQUIRED_PACKAGES_NPM_PREFIX ||
+                `${homedir()}/.npm-global`,
+            }
+          : {};
         const install = await run(
           cmd,
           args.length > 0 ? args : ["install", "--no-audit", "--no-fund"],
-          {},
+          installEnv,
           cwd,
         );
         if (install.code !== 0) {
@@ -422,8 +562,16 @@ async function installGitWith(
         }
         if (defaultCmd === "npm") {
           // npm-built servers ship a `build` script that must run after
-          // install so the entry (dist/bin/stdio.js) exists.
-          const build = await run(cmd, ["run", "build"], {}, cwd);
+          // install so the entry (dist/bin/stdio.js) exists. Run the build in
+          // a development context too — the npm_config_include=dev is an
+          // install-time setting, but NODE_ENV=development keeps a build
+          // script that prunes/optimizes on NODE_ENV=production from breaking.
+          const build = await run(
+            cmd,
+            ["run", "build"],
+            isNpm ? { NODE_ENV: "development" } : {},
+            cwd,
+          );
           if (build.code !== 0) {
             logger.warn(
               `Failed: ${name} (npm run build ${build.code}) — ${build.output.trim().slice(0, 300)}. Spawns will fall back to on-demand build.`,
@@ -489,6 +637,20 @@ export async function installRequiredPackages(): Promise<void> {
   logger.info(
     `[required-packages] starting package pre-install (SERIAL, no concurrency): npm(${npmPackages.length}) uvx(${uvxPackages.length}) uvxArgs(${uvxArgPackages.length}) bun(${bunPackages.length}) gitNpm(${gitNpmPackages.length}) bunGit(${bunGitPackages.length})`,
   );
+
+  // NFS-subpath ownership self-heal: the per-user cache dirs can come up
+  // root-owned (NFS root_squash) and the runner is UID 1001 — verify/repair
+  // ownership + writability BEFORE any install writes into them.
+  ensureCacheDirsWritable([
+    `${homedir()}/.npm-global`,
+    `${homedir()}/.npm`,
+    `${homedir()}/.bun`,
+    `${homedir()}/.cache`,
+    `${homedir()}/.cache/uv`,
+    `${homedir()}/.local`,
+    `${homedir()}/.local/bin`,
+    `${homedir()}/.local/src`,
+  ]);
 
   const tasks: Array<() => Promise<void>> = [];
   if (npmPackages.length > 0) {
