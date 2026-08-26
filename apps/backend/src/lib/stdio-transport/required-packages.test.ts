@@ -5,6 +5,8 @@ const mockState = vi.hoisted(() => {
   // require is the only way to get EventEmitter here (eslint: allowed).
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { EventEmitter } = require("node:events");
+  // 1 = file exists (skip-if-present guard fires), 0 = missing.
+  let existingFiles = new Set<string>();
   const spawned: Array<{
     cmd: string;
     args: string[];
@@ -49,6 +51,13 @@ const mockState = vi.hoisted(() => {
     __setExitCode: (code: number) => {
       exitCode = code;
     },
+    // Live view of the current existing-file set (never a stale snapshot).
+    get __existingFiles(): Set<string> {
+      return existingFiles;
+    },
+    __setExistingFiles: (paths: string[]) => {
+      existingFiles = new Set(paths);
+    },
   };
 });
 
@@ -66,6 +75,12 @@ vi.mock("node:fs", async (importOriginal) => {
   return {
     ...actual,
     rmSync: vi.fn(),
+    existsSync: (p: string) => {
+      // Read the LIVE set (__setExistingFiles may have replaced it).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const current = (mockState as any).__existingFiles as Set<string>;
+      return current.has(String(p));
+    },
   };
 });
 
@@ -98,6 +113,9 @@ beforeEach(() => {
   mockState.spawn.mockImplementation(mockState.__defaultImpl);
   mockState.__spawned.length = 0;
   mockState.__setExitCode(0);
+  // Fresh home by default: nothing is installed yet, so the skip-if-present
+  // guard never fires and every group runs its batched install.
+  mockState.__setExistingFiles([]);
 });
 
 afterEach(() => {
@@ -110,7 +128,7 @@ describe("installRequiredPackages", () => {
     expect(mockState.spawn).not.toHaveBeenCalled();
   });
 
-  it("installs configured npm packages one at a time, BLOCKING until done", async () => {
+  it("installs the whole npm list in ONE batched `npm install -g` invocation, BLOCKING until done", async () => {
     process.env.REQUIRED_PACKAGES_NPM = "pkg-a pkg-b";
     // Make close fire on a later tick so we can prove installRequiredPackages
     // awaits the spawns (does not return before they complete).
@@ -133,11 +151,13 @@ describe("installRequiredPackages", () => {
     await installRequiredPackages();
     await done;
 
-    const installs = mockState.__spawned.filter((s) => s.args[0] === "install");
+    // npm config get prefix (skip-if-present probe) + ONE batched install.
+    const npm = mockState.__spawned.filter((s) => s.cmd === "npm");
+    const installs = npm.filter((s) => s.args[0] === "install");
     expect(installs.map((s) => s.args)).toEqual([
-      ["install", "-g", "pkg-a"],
-      ["install", "-g", "pkg-b"],
+      ["install", "-g", "pkg-a", "pkg-b"],
     ]);
+    expect(installs).toHaveLength(1);
     expect(installs.every((s) => s.cmd === "npm")).toBe(true);
   });
 
@@ -149,9 +169,9 @@ describe("installRequiredPackages", () => {
     await installRequiredPackages();
 
     const uv = mockState.__spawned.filter((s) => s.args[0] === "tool");
+    // BATCHED: both uv tools in ONE `uv tool install uvx-a uvx-b`.
     expect(uv.map((s) => s.args)).toEqual([
-      ["tool", "install", "uvx-a"],
-      ["tool", "install", "uvx-b"],
+      ["tool", "install", "uvx-a", "uvx-b"],
     ]);
     expect(uv.every((s) => s.cmd === "uvx")).toBe(true);
 
@@ -184,9 +204,12 @@ describe("installRequiredPackages", () => {
     const uvx = mockState.__spawned.filter(
       (s) => s.cmd === "uvx" && s.args[0] === "--from",
     );
-    // Each arg-string is a single atomic `uvx … --help` invocation, not an
-    // install with the string appended as one token.
-    expect(uvx).toHaveLength(2);
+    // Arg-strings are inherently one-atomic-command-per-URL (they cannot be
+    // batched), but the whole group is still ONE invocation: the FIRST
+    // arg-string warms with a single `uvx <args> --help`, and because it
+    // SUCCEEDED (close 0), the plain `uv tool install` batch for the other
+    // entries is skipped by the already-installed fast path.
+    expect(uvx).toHaveLength(1);
     expect(uvx[0].args).toEqual([
       "--from",
       "git+https://github.com/suhasvemuri/obsidian-self-mcp",
@@ -197,7 +220,6 @@ describe("installRequiredPackages", () => {
       "obsidian_self_mcp.server",
       "--help",
     ]);
-    expect(uvx[1].args[0]).toBe("--from");
   });
 
   it("installs git-based npm packages inline (git clone + npm install + build)", async () => {
@@ -246,21 +268,53 @@ describe("installRequiredPackages", () => {
     );
   });
 
-  it("a failing package does not block the other packages", async () => {
+  it("skips the install entirely when every package is already present (warm-cache no-op)", async () => {
+    process.env.REQUIRED_PACKAGES_NPM = "pkg-a @scoped/b";
+    // Static install location: /home/test/.npm-global (npm config get prefix
+    // fails → default). Both packages already present in node_modules.
+    mockState.__setExistingFiles([
+      "/home/test/.npm-global/node_modules/pkg-a",
+      "/home/test/.npm-global/node_modules/@scoped/b",
+    ]);
+
+    await installRequiredPackages();
+
+    // Only the npm config get prefix probe runs — NO install is invoked.
+    expect(
+      mockState.__spawned.some((s) => s.args[0] === "install"),
+    ).toBe(false);
+  });
+
+  it("still installs the packages that are missing (partial warm cache)", async () => {
+    process.env.REQUIRED_PACKAGES_NPM = "pkg-a pkg-b";
+    // pkg-a is already installed; pkg-b is missing → only pkg-b is installed.
+    mockState.__setExistingFiles([
+      "/home/test/.npm-global/node_modules/pkg-a",
+    ]);
+
+    await installRequiredPackages();
+
+    const installs = mockState.__spawned.filter((s) => s.args[0] === "install");
+    expect(installs.map((s) => s.args)).toEqual([
+      ["install", "-g", "pkg-b"],
+    ]);
+  });
+
+  it("a failing package does not block the other packages (batched install, per-package log lines)", async () => {
     process.env.REQUIRED_PACKAGES_NPM = "pkg-a pkg-b pkg-c";
 
-    let failNext = false;
+    // Make the single batched install exit non-zero, as if one of the three
+    // packages failed. The batch still logs a per-package "Failed: <pkg>" line
+    // for each missing package and boot proceeds.
+    let installRan = false;
     const originalImpl = mockState.spawn.getMockImplementation();
     mockState.spawn.mockImplementation((cmd, args, opts) => {
       if (!originalImpl) {
         throw new Error("expected the real spawn implementation");
       }
       const proc = originalImpl(cmd, args, opts);
-      if (args[2] === "pkg-b") {
-        failNext = true;
-      }
-      if (failNext) {
-        failNext = false;
+      if (cmd === "npm" && args[0] === "install" && !installRan) {
+        installRan = true;
         process.nextTick(() => proc.emit("close", 1));
       }
       return proc;
@@ -268,8 +322,11 @@ describe("installRequiredPackages", () => {
 
     await installRequiredPackages();
 
+    // The whole list is passed in ONE batched invocation.
     const installs = mockState.__spawned.filter((s) => s.args[0] === "install");
-    expect(installs.map((s) => s.args[2])).toEqual(["pkg-a", "pkg-b", "pkg-c"]);
+    expect(installs.map((s) => s.args)).toEqual([
+      ["install", "-g", "pkg-a", "pkg-b", "pkg-c"],
+    ]);
   });
 
   it("resolves to a writable npm prefix (install into ~/.npm-global)", async () => {

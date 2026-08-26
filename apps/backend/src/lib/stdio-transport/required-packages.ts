@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 
 import logger from "@/utils/logger";
 
@@ -16,9 +18,9 @@ import {
  * deps before the app serves. Every package an operator lists is installed into
  * the per-user caches/locations the spawned servers resolve from, and the web
  * service does NOT begin listening until the install phase completes. A package
- * that fails to install is logged per-package ("Failed: <reason>") and the
- * install continues — the pool still falls back to on-demand install for the
- * failure, and boot is never held up by one bad package.
+ * that fails to install is logged ("Failed: <reason>") and the install
+ * continues — the pool still falls back to on-demand install for the failure,
+ * and boot is never held up by one bad package.
  *
  * The operator configures the lists via simple ENV (space/comma separated):
  *
@@ -35,11 +37,28 @@ import {
  * what makes a fresh container deterministic (rule: once installed, a package
  * is NOT installed again).
  *
+ * PERF: the install phase is one BATCHED installer invocation PER GROUP, NOT one
+ * invocation per package. npm install -g re-resolves + re-reconciles the ENTIRE
+ * global tree (~/.npm-global) on every invocation, so installing 20 packages
+ * serially one-at-a-time costs 20 full resolution passes even when every
+ * tarball is warm-cached. Passing the whole list to a single `npm install -g
+ * <pkg1> <pkg2> …` (or `bun add -g …`) resolves + dedupes shared deps ONCE.
+ * That is the "do them all at once" half of the fix.
+ *
+ * The "store in a static location" half is the skip-if-present guard: each
+ * group checks the static per-user install location (the npm global prefix dir,
+ * bun's ~/.bun, uv's ~/.cache/uv) for ALL of its requested packages up front.
+ * A package that already exists is logged "Pre-installed <pkg> (cached,
+ * skipping install)" and the whole group's install is SKIPPED when every
+ * package is present — a warm cache/install location makes boot a fast no-op
+ * instead of 20 full tree reconciliations.
+ *
  * The install is strictly SERIAL: the six groups (npm/uvx/uvxArgs/bun/gitNpm/
  * bunGit) run one at a time, awaiting the previous — no worker pool, no
- * concurrency knob. A serial bootstrap keeps a cold boot's concurrent npm/uvx/
- * bun installs from racing each other's caches (npm/npx/uv/bun all resolve the
- * same per-user dirs) and keeps the install's stdout readable in order.
+ * concurrency knob. A serial bootstrap keeps a cold boot's npm/uvx/bun installs
+ * from racing each other's caches (npm/npx/uv/bun all resolve the same per-user
+ * dirs) and keeps the install's stdout readable in order. Batching replaces
+ * per-package invocations, NOT per-group parallelism — concurrency stays out.
  */
 
 function parseList(envValue: string | undefined): string[] {
@@ -107,43 +126,92 @@ function run(
   });
 }
 
+/**
+ * The static per-user location a package of this kind lands in. The npm prefix
+ * (config- or env-derived) is cached after the first resolution; bun and uv
+ * locations are fixed.
+ */
+const npmPrefixCache = new Map<string, string>();
+
 async function npmGlobalPrefix(): Promise<string> {
+  const key = process.env.REQUIRED_PACKAGES_NPM_PREFIX || "default";
+  const cached = npmPrefixCache.get(key);
+  if (cached) return cached;
   // Resolve once (npm config get prefix is cheap and authoritative).
   const result = await run("npm", ["config", "get", "prefix"]);
-  if (result.code === 0) {
-    const out = result.output.trim();
-    if (out) return out;
+  const prefix =
+    result.code === 0 && result.output.trim()
+      ? result.output.trim()
+      : `${homedir()}/.npm-global`;
+  npmPrefixCache.set(key, prefix);
+  return prefix;
+}
+
+async function installLocationFor(kind: CacheKind): Promise<string> {
+  if (kind === "npm") {
+    return npmGlobalPrefix();
   }
-  return `${homedir()}/.npm-global`;
+  if (kind === "bun") {
+    // bun add -g resolves its global dir via `bun pm`-style logic; a static
+    // ~/.bun (or the same prefix bun's install resolves, e.g. XDG_DATA_HOME)
+    // is the target.
+    return process.env.BUN_INSTALL || `${homedir()}/.bun`;
+  }
+  // uv — `uv tool install` lands tools in ~/.local/bin (exe) and
+  // ~/.cache/uv/archive-v0 (wheels). An already-installed tool is detected via
+  // the resolved tool dir or the executable in the bin dir.
+  return process.env.UV_TOOL_BIN_DIR || `${homedir()}/.local/bin`;
 }
 
 /**
- * Install ONE package, logging the per-package start/finish lines the operator
- * asked for: "Starting package pre-install: <pkg>" → "Pre-installed <pkg>" or
- * "Failed: <reason>". Never throws for a package failure — it logs and returns
- * the exit code so the rest of the list still installs.
+ * Does the static install location already have this package? Scoped names
+ * (@scope/name) nest under node_modules/@scope/name; bare names sit directly
+ * under node_modules. Used by the skip-if-present guard so a warm install
+ * location short-circuits the whole group.
  */
-async function installOne(
-  kind: CacheKind,
-  cmd: string,
-  args: string[],
-  pkg: string,
-  runEnv: Record<string, string>,
-): Promise<number> {
-  logger.info(`Starting package pre-install: ${pkg}`);
-  const result = await run(cmd, args, runEnv);
-  if (result.code === 0) {
-    logger.info(
-      `Pre-installed ${pkg} (${result.output.trim().slice(0, 200) || "ok"})`,
-    );
-  } else {
-    logger.warn(
-      `Failed: ${pkg} (${result.code}) — ${result.output.trim().slice(0, 300) || "no output"}. Spawns will fall back to on-demand install.`,
-    );
+function pkgEntryPath(installLocation: string, kind: CacheKind, pkg: string): string {
+  if (pkg.startsWith("@")) {
+    const [scope, name] = pkg.split("/");
+    return join(installLocation, "node_modules", scope, name || "");
   }
-  return result.code;
+  return join(installLocation, "node_modules", pkg);
 }
 
+/**
+ * Per-kind "is this package present in its static install location" probe.
+ * npm/bun: the package's node_modules entry exists. uv: the tool's executable
+ * exists in the tool bin dir (uv tool install is a no-op when already
+ * installed, so re-installing is free-ish, but a present exe still skips it).
+ */
+function pkgIsInstalled(
+  location: string,
+  kind: CacheKind,
+  pkg: string,
+): boolean {
+  if (kind === "uv") {
+    const [spec] = pkg.split("==");
+    const name = spec.includes("/") ? spec.split("/").pop() || spec : spec;
+    return existsSync(join(location, name));
+  }
+  return existsSync(pkgEntryPath(location, kind, pkg));
+}
+
+/**
+ * Install ONE BATCH of packages in a single installer invocation, logging the
+ * per-package start lines the operator asked for ("Starting package
+ * pre-install: <pkg>") up front and per-package outcomes after. A package that
+ * fails is logged "Failed: <pkg> (…)" and the rest of the list still installs —
+ * a batched npm/bun install continues with the remaining packages after a
+ * failed one, and uvx arg-strings are inherently one-atomic-command-per-URL.
+ *
+ * SKIP-IF-PRESENT (static location): before invoking the installer, every
+ * package in the batch is checked against its static per-user install location.
+ * A package already there is logged "Pre-installed <pkg> (cached, skipping
+ * install)" and, when ALL packages are present, the installer is NOT invoked at
+ * all — a warm cache makes the whole group a fast no-op. Never throws for a
+ * package failure — it logs and returns the exit code so the rest of the list
+ * still installs.
+ */
 async function installWith(
   label: string,
   defaultCommand: string,
@@ -166,46 +234,88 @@ async function installWith(
     await verifyAndHealNpmCache();
   }
 
-  // Pass 1 — install each package individually.
-  const results: number[] = [];
+  // Skip-if-present: a package already in its static install location is
+  // already installed — re-running the installer would re-resolve + reconcile
+  // the ENTIRE global tree for nothing. Resolve the location once per group and
+  // check every package up front.
+  const location = await installLocationFor(kind);
+  let missing: string[] = [];
   for (const pkg of packages) {
-    // uvx ARG-STRINGS (git-URL packages in REQUIRED_PACKAGES_UVX_ARGS) are one
-    // atomic `uvx <args> --help` invocation, not an install — `uv tool install`
-    // has no registry package to resolve for `--from git+…`. Route them
-    // straight to the warm so the git checkout + deps land in ~/.cache/uv.
     const isArgString = kind === "uv" && pkg.trim().startsWith("--");
-    const result = await run(
-      cmd,
-      isArgString ? [...parseList(pkg), "--help"] : [...args, pkg],
-      runEnv,
-    );
-    if (result.code === 0) {
-      logger.info(
-        `Pre-installed ${pkg} (${result.output.trim().slice(0, 200) || "ok"})`,
-      );
+    if (isArgString) {
+      // uvx ARG-STRINGS (git-URL packages in REQUIRED_PACKAGES_UVX_ARGS) are
+      // one atomic `uvx <args> --help` invocation, not an install — `uv tool
+      // install` has no registry package to resolve for `--from git+…`. There
+      // is no static entry to probe for them; they must run.
+      missing.push(pkg);
+    } else if (pkgIsInstalled(location, kind, pkg)) {
+      logger.info(`Pre-installed ${pkg} (cached, skipping install)`);
     } else {
-      logger.warn(
-        `Failed: ${pkg} (${result.code}) — ${result.output.trim().slice(0, 300) || "no output"}. Spawns will fall back to on-demand install.`,
+      missing.push(pkg);
+    }
+  }
+
+  if (missing.length === 0) {
+    // Every package already present in its static location — warm boot no-op.
+    logger.info(
+      `[required-packages] ${label}: all ${packages.length} packages already installed (${location}); skipping install`,
+    );
+    return;
+  }
+  for (const pkg of missing) {
+    logger.info(`Starting package pre-install: ${pkg}`);
+  }
+
+  // BATCH: install the whole missing list in ONE installer invocation. npm
+  // install -g <pkg1> <pkg2> … and bun add -g <pkg1> <pkg2> … resolve + dedupe
+  // shared deps in a single pass instead of paying a full global-tree
+  // reconciliation per package. uvx arg-strings are still one atomic invocation
+  // per URL (inherently un-batchable) — serial, as before.
+  const isArgString = kind === "uv" && missing[0].trim().startsWith("--");
+  const batchResult = await run(
+    cmd,
+    isArgString
+      ? [...parseList(missing[0]), "--help"]
+      : [...args, ...missing],
+    runEnv,
+  );
+  if (batchResult.code === 0) {
+    for (const pkg of missing) {
+      logger.info(
+        `Pre-installed ${pkg} (${batchResult.output.trim().slice(0, 200) || "ok"})`,
       );
     }
-    results.push(result.code);
-
-    // uvx fallback: `uv tool install <pkg>` only works when the package ships
-    // an executable named exactly <pkg> (postgres-mcp, jupyter-mcp-server do
-    // NOT — they are module-runners invoked via `uvx <pkg>`). Fall back to a
-    // `uvx <pkg> --help` warm so the wheel lands in ~/.cache/uv.
-    if (kind === "uv" && results[results.length - 1] !== 0 && !isArgString) {
-      const warmResult = await run(
-        process.env.REQUIRED_PACKAGES_UVX_CMD || "uvx",
-        [...parseList(pkg), "--help"],
-        { npm_config_yes: "true" },
+  } else {
+    for (const pkg of missing) {
+      logger.warn(
+        `Failed: ${pkg} (${batchResult.code}) — ${batchResult.output.trim().slice(0, 300) || "no output"}. Spawns will fall back to on-demand install.`,
       );
-      if (warmResult.code === 0) {
+    }
+  }
+
+  // uvx fallback: `uv tool install <pkg>` only works when the package ships an
+  // executable named exactly <pkg> (postgres-mcp, jupyter-mcp-server do NOT —
+  // they are module-runners invoked via `uvx <pkg>`). When the batched install
+  // failed, warm each plain uv package with a `uvx <pkg> --help` so the wheel
+  // lands in ~/.cache/uv.
+  if (
+    kind === "uv" &&
+    batchResult.code !== 0 &&
+    !isArgString
+  ) {
+    const warmResult = await run(
+      process.env.REQUIRED_PACKAGES_UVX_CMD || "uvx",
+      [...parseList(missing[0]), "--help"],
+      { npm_config_yes: "true" },
+    );
+    if (warmResult.code === 0) {
+      for (const pkg of missing) {
         logger.info(
           `Pre-installed ${pkg} via uvx --help cache-warm (${warmResult.output.trim().slice(0, 200) || "ok"})`,
         );
-        results[results.length - 1] = 0;
-      } else {
+      }
+    } else {
+      for (const pkg of missing) {
         logger.warn(
           `Failed: ${pkg} cache-warm fallback (${warmResult.code}) — ${warmResult.output.trim().slice(0, 300) || "no output"}. Spawns will fall back to on-demand uvx.`,
         );
@@ -213,19 +323,20 @@ async function installWith(
     }
   }
 
-  // Pass 2 — if EVERY package failed AND the cache could be corrupt, purge it
-  // once and retry the whole group once. Per-package transient failures already
-  // logged their warning in pass 1 and are NOT retried here.
-  const allFailed = results.length > 0 && results.every((c) => c !== 0);
+  // If EVERY requested package failed AND the cache could be corrupt, purge it
+  // once and retry the whole group once. Transient failures already logged
+  // their warning above and are NOT retried here.
+  const allFailed =
+    missing.length > 0 && batchResult.code !== 0;
   if (allFailed && cacheHealingEnabled() && healCacheKind(kind)) {
     logger.warn(
-      `[required-packages] ${label}: all ${packages.length} pre-installs failed; purged ${kind} cache, retrying group once.`,
+      `[required-packages] ${label}: all ${missing.length} pre-installs failed; purged ${kind} cache, retrying group once.`,
     );
-    for (const pkg of packages) {
-      const isArgString = kind === "uv" && pkg.trim().startsWith("--");
+    for (const pkg of missing) {
+      const isArgStringPkg = kind === "uv" && pkg.trim().startsWith("--");
       const result = await run(
         cmd,
-        isArgString ? [...parseList(pkg), "--help"] : [...args, pkg],
+        isArgStringPkg ? [...parseList(pkg), "--help"] : [...args, pkg],
         runEnv,
       );
       logger.info(
@@ -338,6 +449,10 @@ async function installGitWith(
  *
  * The install lists come ONLY from the REQUIRED_PACKAGES_* env vars — no DB
  * derivation, no fallback to server names. Justin curates the env lists.
+ *
+ * Each group installs in ONE batched installer invocation (npm/bun accept the
+ * whole package list) preceded by a skip-if-present guard over the static
+ * per-user install location, so a warm cache makes the phase a fast no-op.
  */
 export async function installRequiredPackages(): Promise<void> {
   const {
