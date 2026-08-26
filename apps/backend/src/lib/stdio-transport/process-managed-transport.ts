@@ -1,4 +1,5 @@
 import { ChildProcess, IOType } from "node:child_process";
+import { homedir } from "node:os";
 import process from "node:process";
 import { PassThrough, Stream } from "node:stream";
 
@@ -8,6 +9,7 @@ import spawn from "cross-spawn";
 
 import logger from "@/utils/logger";
 
+import { maybeHealOnFastCrash } from "./cache-health";
 import { ReadBuffer, serializeMessage } from "./shared";
 
 export type StdioServerParameters = {
@@ -110,6 +112,34 @@ export function getDefaultEnvironment(): Record<string, string> {
     env[key] = value;
   }
 
+  // Always append the runtime's own bin dirs to PATH so tools installed at
+  // the system level (bun/bunx, global npx packages) resolve for spawned
+  // servers. In the Docker image the runtime runs as `USER nextjs`, whose
+  // non-login shells do not read ~/.bashrc, so a $HOME-based install would
+  // be unreachable by spawned processes — the image installs bun under
+  // /usr/local precisely so this appending finds it.
+  const inheritedPath = env["PATH"] ?? process.env.PATH ?? "";
+  const ownBinDir = process.execPath.replace(/\/[^/]+$/, "");
+  const extraDirs = ["/usr/local/bin", "/usr/bin", "/bin", ownBinDir];
+  env["PATH"] = [...new Set([...extraDirs, ...inheritedPath.split(":")])]
+    .filter(Boolean)
+    .join(":");
+
+  // Point `npm exec` / `npx -y` spawns at the same user-writable prefix the
+  // required-packages install phase (required-packages.ts) installs into.
+  // Without this, every npm MCP spawn re-resolves against the image default
+  // prefix (usually /usr, which is not where the install wrote) and
+  // re-installs the package into its own ~/.npm/_npx/<hash> cache — 20+ copies
+  // of the same dependency tree, each holding 130-200MB RSS. With the prefix
+  // pinned to the global install, `npm exec -y <pkg>` finds the already-
+  // installed package and skips the download entirely (rule: packages are
+  // installed once, then reused).
+  if (env["npm_config_prefix"] === undefined) {
+    const warmPrefix =
+      process.env.REQUIRED_PACKAGES_NPM_PREFIX || `${homedir()}/.npm-global`;
+    env["npm_config_prefix"] = warmPrefix;
+  }
+
   return env;
 }
 
@@ -125,6 +155,7 @@ export class ProcessManagedStdioTransport implements Transport {
   private _serverParams: StdioServerParameters;
   private _stderrStream: PassThrough | null = null;
   private _isCleanup: boolean = false;
+  private _spawnedAt: number | null = null;
 
   onclose?: () => void;
   onerror?: (error: Error) => void;
@@ -149,6 +180,7 @@ export class ProcessManagedStdioTransport implements Transport {
     }
 
     return new Promise((resolve, reject) => {
+      this._spawnedAt = Date.now();
       this._process = spawn(
         this._serverParams.command,
         this._serverParams.args ?? [],
@@ -192,6 +224,16 @@ export class ProcessManagedStdioTransport implements Transport {
         // Only emit crash event if this wasn't a clean shutdown
         if (!this._isCleanup && (code !== 0 || signal)) {
           logger.warn(`Process crashed with code: ${code}, signal: ${signal}`);
+          // A stdio server that dies fast with a non-zero exit (long before
+          // the connect timeout) is failing on local cache resolution —
+          // "npx cache corrupted" etc. With MCP_CACHE_HEAL=1, purge the cache
+          // it resolves from so the pool's retry runs against a fresh store
+          // instead of a corrupt one. Healthy warm caches are never touched.
+          maybeHealOnFastCrash(
+            this._serverParams.command,
+            code,
+            Date.now() - (this._spawnedAt ?? Date.now()),
+          );
           logger.info(
             `Calling onprocesscrash handler: ${this.onprocesscrash ? "handler exists" : "no handler"}`,
           );

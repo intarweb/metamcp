@@ -88,6 +88,7 @@ async function start(): Promise<void> {
   await initializeOnStartup();
 
   app.listen(12009, async () => {
+    console.log("[startup] backend serving on port 12009");
     console.log(`Server is running on port 12009`);
     console.log(`Auth routes available at: http://localhost:12009/api/auth`);
     console.log(
