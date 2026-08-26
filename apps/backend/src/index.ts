@@ -5,6 +5,7 @@ import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
 import publicEndpointsRouter from "./routers/public-metamcp";
+import { installRequiredPackages } from "./lib/stdio-transport/required-packages";
 import trpcRouter from "./routers/trpc";
 import logger from "./utils/logger";
 
@@ -84,6 +85,12 @@ app.use("/mcp-proxy", mcpProxyRouter);
 app.use("/trpc", trpcRouter);
 
 async function start(): Promise<void> {
+  // Required-package install phase FIRST — nothing runs before it (this is a
+  // bootstrap: packages land before any other startup work, including the env
+  // bootstrap, so cold spawns always hit warm caches). Blocking; the HTTP
+  // server does not begin listening until this completes.
+  await installRequiredPackages();
+
   // Startup initialization (must run after DB is reachable/migrations are applied, and before listening)
   await initializeOnStartup();
 

@@ -6,7 +6,6 @@ import { metaMcpServerPool } from "./metamcp";
 import { backgroundToolsSync } from "./metamcp/background-tools-sync";
 import { serverErrorTracker } from "./metamcp/server-error-tracker";
 import { convertDbServerToParams } from "./metamcp/utils";
-import { installRequiredPackages } from "./stdio-transport/required-packages";
 
 /**
  * Startup initialization that must happen before the HTTP server begins listening.
@@ -40,13 +39,6 @@ export async function initializeOnStartup(): Promise<void> {
   } else {
     console.log("Environment bootstrap disabled via BOOTSTRAP_ENABLE=false");
   }
-
-  // Required-package install phase — BLOCKING, like deps before the app serves.
-  // Installs every package in REQUIRED_PACKAGES_NPM/UVX/BUN (+ git-build specs)
-  // into the per-user caches (~/.npm-global, ~/.cache/uv, ~/.bun) so cold
-  // spawns hit warm caches instead of downloading on first connect. The web
-  // service does NOT begin listening until this completes.
-  await installRequiredPackages();
 }
 
 /**
