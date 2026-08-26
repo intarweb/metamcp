@@ -28,13 +28,18 @@ import {
  *   REQUIRED_PACKAGES_BUN="bunpkg1"                # bun add -g → ~/.bun
  *   REQUIRED_PACKAGES_GIT_NPM="git+https://…#<subdir>|#<command>|#<args>" # git clone + npm build
  *   REQUIRED_PACKAGES_BUN_GIT="git+https://…#<subdir>|#<command>|#<args>" # git clone + bun build
- *   REQUIRED_PACKAGES_CONCURRENCY=2                # installers at once (default 2)
  *
  * The npm/uvx/bun lists install into standard per-user cache dirs
  * (~/.npm-global, ~/.cache/uv, ~/.bun) which are both volume-mountable AND
  * persist across container restarts without a volume — the install phase is
  * what makes a fresh container deterministic (rule: once installed, a package
  * is NOT installed again).
+ *
+ * The install is strictly SERIAL: the six groups (npm/uvx/uvxArgs/bun/gitNpm/
+ * bunGit) run one at a time, awaiting the previous — no worker pool, no
+ * concurrency knob. A serial bootstrap keeps a cold boot's concurrent npm/uvx/
+ * bun installs from racing each other's caches (npm/npx/uv/bun all resolve the
+ * same per-user dirs) and keeps the install's stdout readable in order.
  */
 
 function parseList(envValue: string | undefined): string[] {
@@ -366,12 +371,8 @@ export async function installRequiredPackages(): Promise<void> {
     return;
   }
 
-  const concurrency = parseInt(
-    process.env.REQUIRED_PACKAGES_CONCURRENCY || "2",
-    10,
-  );
   logger.info(
-    `[required-packages] starting package pre-install: npm(${npmPackages.length}) uvx(${uvxPackages.length}) uvxArgs(${uvxArgPackages.length}) bun(${bunPackages.length}) gitNpm(${gitNpmPackages.length}) bunGit(${bunGitPackages.length}) concurrency=${concurrency}`,
+    `[required-packages] starting package pre-install (SERIAL, no concurrency): npm(${npmPackages.length}) uvx(${uvxPackages.length}) uvxArgs(${uvxArgPackages.length}) bun(${bunPackages.length}) gitNpm(${gitNpmPackages.length}) bunGit(${bunGitPackages.length})`,
   );
 
   const tasks: Array<() => Promise<void>> = [];
@@ -431,25 +432,16 @@ export async function installRequiredPackages(): Promise<void> {
     tasks.push(() => installGitWith("bun-git", "bun", bunGitPackages));
   }
 
-  // Strict worker pool: each worker pulls the next task only after the previous
-  // one finishes, so concurrent installers never exceed `concurrency`.
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (next < tasks.length) {
-      const task = tasks[next];
-      next += 1;
-      try {
-        await task();
-      } catch (error) {
-        logger.error("[required-packages] unexpected install task failure:", error);
-      }
+  // SERIAL bootstrap: run each group one at a time, awaiting the previous. No
+  // concurrency — a cold boot must not have npm/uvx/bun installs racing each
+  // other's caches (npx, uv, and bun all resolve the same per-user dirs).
+  for (const task of tasks) {
+    try {
+      await task();
+    } catch (error) {
+      logger.error("[required-packages] unexpected install task failure:", error);
     }
-  };
-  const workers: Promise<void>[] = [];
-  for (let i = 0; i < concurrency && i < tasks.length; i += 1) {
-    workers.push(worker());
   }
-  await Promise.allSettled(workers);
 
   logger.info("[required-packages] install phase complete");
 }

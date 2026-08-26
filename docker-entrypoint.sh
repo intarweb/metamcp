@@ -97,13 +97,17 @@ wait_for_postgres
 # Run migrations
 run_migrations
 
-# Start backend in the background, capturing its output so the wait loop can
-# grep for the "[startup] backend serving on port 12009" readiness marker.
+# Start backend in the background. Direct file redirect (proven, unbuffered at
+# the shell level) so the wait loop's marker grep sees the line immediately —
+# the SAME path as before. A separate `tail -F` copier streams that same file
+# to OUR stdout so install + MCP lifecycle logs ALSO reach `docker logs`.
 echo "Starting backend server..."
 cd /app/apps/backend
 BACKEND_OUT=/tmp/backend.out
+: > "$BACKEND_OUT"
 PORT=12009 node dist/index.js > "$BACKEND_OUT" 2>&1 &
 BACKEND_PID=$!
+tail -n +1 -F "$BACKEND_OUT" &
 
 # Wait for the backend to actually bind + answer /health. The health-wait
 # (kill) timer only starts AFTER the install phase completes — on cold boots
