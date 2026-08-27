@@ -1,5 +1,8 @@
+import {
+  ListToolsResultSchema,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
 import { ServerParameters } from "@repo/zod-types";
-import { ListToolsResultSchema, Tool } from "@modelcontextprotocol/sdk/types.js";
 
 import logger from "@/utils/logger";
 
@@ -39,7 +42,10 @@ class BackgroundToolsSync {
 
   constructor(syncIntervalMs: number = 60_000) {
     this.syncIntervalMs = syncIntervalMs;
-    this.ttlMs = parseInt(process.env.MCP_TOOLS_TTL_MS || `${DEFAULT_TTL_MS}`, 10);
+    this.ttlMs = parseInt(
+      process.env.MCP_TOOLS_TTL_MS || `${DEFAULT_TTL_MS}`,
+      10,
+    );
   }
 
   /** Start the periodic loop (idempotent). */
@@ -73,10 +79,17 @@ class BackgroundToolsSync {
    * Debounced single-server refresh. Called from the request path when a server
    * is stale/absent. Non-blocking; returns immediately.
    */
-  ensureFresh(serverUuid: string, params: ServerParameters, namespaceUuid: string): void {
+  ensureFresh(
+    serverUuid: string,
+    params: ServerParameters,
+    namespaceUuid: string,
+  ): void {
     if (this.inFlight.has(serverUuid)) return;
     this.syncServer(serverUuid, params, namespaceUuid).catch((error) => {
-      logger.error(`[tools-sync] background refresh failed for ${serverUuid}:`, error);
+      logger.error(
+        `[tools-sync] background refresh failed for ${serverUuid}:`,
+        error,
+      );
     });
   }
 
@@ -118,7 +131,8 @@ class BackgroundToolsSync {
     if (this.inFlight.has(serverUuid)) return;
     this.inFlight.add(serverUuid);
     try {
-      const timeout = await configService.getMcpTimeoutForNamespace(namespaceUuid);
+      const timeout =
+        await configService.getMcpTimeoutForNamespace(namespaceUuid);
       const tools = await this.fetchToolsForServer(params, timeout);
       // Circuit breaker: a clean sync (tools fetched) is evidence the backend
       // is healthy — clear any prior tripped state so a recovered server is

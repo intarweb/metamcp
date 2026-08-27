@@ -64,10 +64,7 @@ export class ToolsRepository {
         and(
           eq(namespaceToolMappingsTable.namespace_uuid, namespaceUuid),
           eq(namespaceToolMappingsTable.status, "ACTIVE"),
-          inArray(
-            toolsTable.mcp_server_uuid,
-            activeServerUuids,
-          ),
+          inArray(toolsTable.mcp_server_uuid, activeServerUuids),
         ),
       )
       .orderBy(toolsTable.name);

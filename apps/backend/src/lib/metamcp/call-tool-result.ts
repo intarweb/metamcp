@@ -68,7 +68,9 @@ export function normalizeCallToolResult(
     };
   }
 
-  const needsCoercion = content.some((block) => !isConformingContentBlock(block));
+  const needsCoercion = content.some(
+    (block) => !isConformingContentBlock(block),
+  );
 
   if (!needsCoercion) {
     return result;

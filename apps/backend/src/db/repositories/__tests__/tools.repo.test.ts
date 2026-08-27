@@ -100,7 +100,7 @@ vi.mock("../../index", () => ({
           const first = h.firstRow(values);
 
           // Execute a fresh-insert or conflict-update against the fake store.
-          const executeUpsert = (set: any, target: unknown): any[] => {
+          const executeUpsert = (set: any, _target: unknown): any[] => {
             const key = isTools
               ? `${first.mcp_server_uuid}:${first.name}`
               : `${first.namespace_uuid}:${first.tool_uuid}`;
@@ -237,7 +237,8 @@ describe("ToolsRepository.syncTools — preserves operator-set mapping status", 
       namespaceUuid,
     );
 
-    const toolUuid = first.upserted[0]!.uuid;
+    const toolUuid = first.upserted[0]?.uuid;
+    expect(toolUuid).toBeDefined();
     expect(h.mappingsStore.get(`${namespaceUuid}:${toolUuid}`)?.status).toBe(
       "ACTIVE",
     );
@@ -257,8 +258,7 @@ describe("ToolsRepository.syncTools — preserves operator-set mapping status", 
 
     // 4. The operator's INACTIVE status must survive the sync.
     const after = h.mappingsStore.get(`${namespaceUuid}:${toolUuid}`);
-    expect(after).toBeDefined();
-    expect(after!.status).toBe("INACTIVE");
+    expect(after?.status).toBe("INACTIVE");
   });
 
   it("syncTools inserts NEW mappings as ACTIVE (no operator intent yet)", async () => {
@@ -270,7 +270,8 @@ describe("ToolsRepository.syncTools — preserves operator-set mapping status", 
       namespaceUuid,
     );
 
-    const toolUuid = result.upserted[0]!.uuid;
+    const toolUuid = result.upserted[0]?.uuid;
+    expect(toolUuid).toBeDefined();
     expect(h.mappingsStore.get(`${namespaceUuid}:${toolUuid}`)?.status).toBe(
       "ACTIVE",
     );
@@ -285,7 +286,11 @@ describe("ToolsRepository.syncTools — preserves operator-set mapping status", 
       namespaceUuid,
     );
 
-    const toolUuid = h.toolsStore.get(`${serverUuid}:${readFileTool.name}`)!.uuid;
+    const storedTool = h.toolsStore.get(`${serverUuid}:${readFileTool.name}`);
+    if (!storedTool) {
+      throw new Error("Expected stored tool to exist before disabling");
+    }
+    const toolUuid = storedTool.uuid;
     await setMappingStatus(namespaceUuid, toolUuid, "INACTIVE");
 
     await repo.syncTools(

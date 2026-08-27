@@ -1,6 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
 import { ServerParameters } from "@repo/zod-types";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The pool's module graph transitively imports the DB (configService /
 // serverErrorTracker), which throws at import time without DATABASE_URL. A
@@ -154,10 +153,10 @@ describe("McpServerPool dead-connection recovery", () => {
 
     // Private-method spy: cast through unknown so TS allows spying on the
     // private createNewConnection (the same pattern the other pool tests use).
-    vi.spyOn(
-      mcpServerPool as unknown as { createNewConnection: typeof mcpServerPool["createNewConnection"] },
-      "createNewConnection",
-    ).mockResolvedValue(live);
+    const poolWithPrivate = mcpServerPool as unknown as {
+      createNewConnection: (typeof mcpServerPool)["createNewConnection"];
+    };
+    vi.spyOn(poolWithPrivate, "createNewConnection").mockResolvedValue(live);
 
     const session = await mcpServerPool.getSession(
       sessionId,

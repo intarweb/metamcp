@@ -43,7 +43,7 @@ const mockState = vi.hoisted(() => {
     proc.stderr = new EventEmitter();
     const env =
       typeof opts === "object" && opts !== null && "env" in opts
-        ? (opts as { env?: Record<string, string> }).env ?? {}
+        ? ((opts as { env?: Record<string, string> }).env ?? {})
         : {};
     spawned.push({ cmd, args, env, proc });
     const code = exitCode;
@@ -104,7 +104,7 @@ vi.mock("node:fs", async (importOriginal) => {
     rmSync: vi.fn(),
     existsSync: (p: string) => {
       // Read the LIVE set (__setExistingFiles may have replaced it).
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
       const current = (mockState as any).__existingFiles as Set<string>;
       return current.has(String(p));
     },
@@ -181,7 +181,6 @@ describe("installRequiredPackages", () => {
       resolveFlag = resolve;
     });
     mockState.spawn.mockImplementation((cmd, args, opts) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const proc = mockState.__defaultImpl(cmd, args, opts) as any;
       proc.on("close", () => {
         setTimeout(() => {
@@ -371,7 +370,9 @@ describe("installRequiredPackages", () => {
     });
     // Explicit `|#` parts are preserved.
     expect(
-      parseGitSpec("git+https://github.com/a/b#pkg|#sub|#npm|#install --no-audit"),
+      parseGitSpec(
+        "git+https://github.com/a/b#pkg|#sub|#npm|#install --no-audit",
+      ),
     ).toEqual({
       repo: "git+https://github.com/a/b#pkg",
       subdir: "sub",
@@ -458,24 +459,20 @@ describe("installRequiredPackages", () => {
     await installRequiredPackages();
 
     // Only the npm config get prefix probe runs — NO install is invoked.
-    expect(
-      mockState.__spawned.some((s) => s.args[0] === "install"),
-    ).toBe(false);
+    expect(mockState.__spawned.some((s) => s.args[0] === "install")).toBe(
+      false,
+    );
   });
 
   it("still installs the packages that are missing (partial warm cache)", async () => {
     process.env.REQUIRED_PACKAGES_NPM = "pkg-a pkg-b";
     // pkg-a is already installed; pkg-b is missing → only pkg-b is installed.
-    mockState.__setExistingFiles([
-      "/home/test/.npm-global/node_modules/pkg-a",
-    ]);
+    mockState.__setExistingFiles(["/home/test/.npm-global/node_modules/pkg-a"]);
 
     await installRequiredPackages();
 
     const installs = mockState.__spawned.filter((s) => s.args[0] === "install");
-    expect(installs.map((s) => s.args)).toEqual([
-      ["install", "-g", "pkg-b"],
-    ]);
+    expect(installs.map((s) => s.args)).toEqual([["install", "-g", "pkg-b"]]);
   });
 
   it("a failing package does not block the other packages (batched install, per-package log lines)", async () => {

@@ -109,7 +109,10 @@ function parseArgsList(envValue: string | undefined): string[] {
  */
 export function sanitizeGitRepo(repo: string): string | null {
   const trimmed = repo.trim().replace(/\|+$/, "");
-  if (!trimmed.startsWith("git+https://") && !trimmed.startsWith("git+ssh://")) {
+  if (
+    !trimmed.startsWith("git+https://") &&
+    !trimmed.startsWith("git+ssh://")
+  ) {
     return null;
   }
   return trimmed;
@@ -204,7 +207,11 @@ async function installLocationFor(kind: CacheKind): Promise<string> {
  * under node_modules. Used by the skip-if-present guard so a warm install
  * location short-circuits the whole group.
  */
-function pkgEntryPath(installLocation: string, kind: CacheKind, pkg: string): string {
+function pkgEntryPath(
+  installLocation: string,
+  kind: CacheKind,
+  pkg: string,
+): string {
   if (pkg.startsWith("@")) {
     const [scope, name] = pkg.split("/");
     return join(installLocation, "node_modules", scope, name || "");
@@ -261,8 +268,7 @@ async function installWith(
   const runEnv: Record<string, string> = { npm_config_yes: "true" };
   if (kind === "npm") {
     runEnv.npm_config_prefix =
-      process.env.REQUIRED_PACKAGES_NPM_PREFIX ||
-      `${homedir()}/.npm-global`;
+      process.env.REQUIRED_PACKAGES_NPM_PREFIX || `${homedir()}/.npm-global`;
   }
 
   if (kind === "npm" && cacheHealingEnabled()) {
@@ -274,7 +280,7 @@ async function installWith(
   // the ENTIRE global tree for nothing. Resolve the location once per group and
   // check every package up front.
   const location = await installLocationFor(kind);
-  let missing: string[] = [];
+  const missing: string[] = [];
   for (const pkg of packages) {
     const isArgString = kind === "uv" && pkg.trim().startsWith("--");
     if (isArgString) {
@@ -309,9 +315,7 @@ async function installWith(
   const isArgString = kind === "uv" && missing[0].trim().startsWith("--");
   const batchResult = await run(
     cmd,
-    isArgString
-      ? [...parseList(missing[0]), "--help"]
-      : [...args, ...missing],
+    isArgString ? [...parseList(missing[0]), "--help"] : [...args, ...missing],
     runEnv,
   );
   if (batchResult.code === 0) {
@@ -333,11 +337,7 @@ async function installWith(
   // they are module-runners invoked via `uvx <pkg>`). When the batched install
   // failed, warm each plain uv package with a `uvx <pkg> --help` so the wheel
   // lands in ~/.cache/uv.
-  if (
-    kind === "uv" &&
-    batchResult.code !== 0 &&
-    !isArgString
-  ) {
+  if (kind === "uv" && batchResult.code !== 0 && !isArgString) {
     const warmResult = await run(
       process.env.REQUIRED_PACKAGES_UVX_CMD || "uvx",
       [...parseList(missing[0]), "--help"],
@@ -361,8 +361,7 @@ async function installWith(
   // If EVERY requested package failed AND the cache could be corrupt, purge it
   // once and retry the whole group once. Transient failures already logged
   // their warning above and are NOT retried here.
-  const allFailed =
-    missing.length > 0 && batchResult.code !== 0;
+  const allFailed = missing.length > 0 && batchResult.code !== 0;
   if (allFailed && cacheHealingEnabled() && healCacheKind(kind)) {
     logger.warn(
       `[required-packages] ${label}: all ${missing.length} pre-installs failed; purged ${kind} cache, retrying group once.`,
@@ -477,17 +476,28 @@ async function installGitWith(
     // ENOENT root cause. Strip it so the URL is a plain https:// or ssh:// that
     // `git clone` accepts directly.
     const cloneUrl = repo.replace(/^git\+/, "");
-    const name = cloneUrl.split("/").pop()?.replace(/\.git$/, "") || "git-pkg";
+    const name =
+      cloneUrl
+        .split("/")
+        .pop()
+        ?.replace(/\.git$/, "") || "git-pkg";
     const dest = `${homedir()}/.local/src/${name}`;
     logger.info(`Starting package pre-install: ${name} (git ${cloneUrl})`);
 
     try {
-      const binExists = (await run("test", ["-x", `${binDir}/${name}`])).code === 0;
+      const binExists =
+        (await run("test", ["-x", `${binDir}/${name}`])).code === 0;
       const destExists = (await run("test", ["-d", dest])).code === 0;
       if (!binExists || !destExists) {
         // Clone shallow (fast + cache-friendly). `cloneUrl` has the `git+`
         // marker stripped — see the loop top.
-        const clone = await run("git", ["clone", "--depth", "1", cloneUrl, dest]);
+        const clone = await run("git", [
+          "clone",
+          "--depth",
+          "1",
+          cloneUrl,
+          dest,
+        ]);
         if (clone.code !== 0) {
           logger.warn(
             `Failed: ${name} (git clone ${clone.code}) — ${clone.output.trim().slice(0, 200)}. Spawns will fall back to on-demand build.`,
@@ -520,7 +530,13 @@ async function installGitWith(
         }
         const build = await run(
           cmd,
-          ["build", "src/index.ts", "--compile", "--outfile", `${binDir}/${name}`],
+          [
+            "build",
+            "src/index.ts",
+            "--compile",
+            "--outfile",
+            `${binDir}/${name}`,
+          ],
           {},
           cwd,
         );
@@ -661,7 +677,9 @@ export async function installRequiredPackages(): Promise<void> {
 
   const tasks: Array<() => Promise<void>> = [];
   if (npmPackages.length > 0) {
-    logger.info(`[required-packages] npm install list: ${npmPackages.join(" ")}`);
+    logger.info(
+      `[required-packages] npm install list: ${npmPackages.join(" ")}`,
+    );
     tasks.push(() =>
       installWith(
         "npm",
@@ -723,7 +741,10 @@ export async function installRequiredPackages(): Promise<void> {
     try {
       await task();
     } catch (error) {
-      logger.error("[required-packages] unexpected install task failure:", error);
+      logger.error(
+        "[required-packages] unexpected install task failure:",
+        error,
+      );
     }
   }
 

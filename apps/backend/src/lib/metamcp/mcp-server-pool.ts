@@ -1087,17 +1087,6 @@ export class McpServerPool {
   }
 
   /**
-   * Decrement the live connection count for a session's namespace (called when a
-   * connection is destroyed, not recycled).
-   */
-  private decrementNamespaceConnection(sessionId: string): void {
-    const ns = this.sessionNamespaces.get(sessionId);
-    if (!ns) return;
-    const count = this.namespaceConnections.get(ns) || 0;
-    this.namespaceConnections.set(ns, Math.max(0, count - 1));
-  }
-
-  /**
    * Release the per-namespace accounting for one pooled client — the inverse of
    * createNewConnection's increment. Uses the WeakMap recorded at create time so
    * the decrement is exact and idempotent (a client created with no namespace,
@@ -1747,7 +1736,8 @@ export class McpServerPool {
         // transport failure means the session is dead. Without this guard the
         // pool destroys and recreates a healthy idle connection repeatedly for
         // every server that lacks `ping` (folded from upstream PR #337).
-        const pingError = error instanceof Error ? error.message : String(error);
+        const pingError =
+          error instanceof Error ? error.message : String(error);
         const pingCode = (error as { code?: unknown })?.code;
         if (
           pingCode === -32601 ||

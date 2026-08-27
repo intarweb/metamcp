@@ -18,7 +18,9 @@ export interface MetaMcpLogEntry {
 function formatError(error: unknown): string {
   if (error instanceof Error) {
     const code = (error as NodeJS.ErrnoException).code;
-    return code !== undefined ? `${error.message} (code: ${code})` : error.message;
+    return code !== undefined
+      ? `${error.message} (code: ${code})`
+      : error.message;
   }
   return String(error);
 }

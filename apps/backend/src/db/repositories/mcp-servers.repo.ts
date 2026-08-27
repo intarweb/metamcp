@@ -113,10 +113,7 @@ export class McpServersRepository {
       .from(mcpServersTable)
       .innerJoin(
         namespaceServerMappingsTable,
-        eq(
-          namespaceServerMappingsTable.mcp_server_uuid,
-          mcpServersTable.uuid,
-        ),
+        eq(namespaceServerMappingsTable.mcp_server_uuid, mcpServersTable.uuid),
       )
       .where(
         eq(

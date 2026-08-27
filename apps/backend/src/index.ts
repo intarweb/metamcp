@@ -2,10 +2,10 @@ import express from "express";
 
 import { auth } from "./auth";
 import { initializeIdleServers, initializeOnStartup } from "./lib/startup";
+import { installRequiredPackages } from "./lib/stdio-transport/required-packages";
 import mcpProxyRouter from "./routers/mcp-proxy";
 import oauthRouter from "./routers/oauth";
 import publicEndpointsRouter from "./routers/public-metamcp";
-import { installRequiredPackages } from "./lib/stdio-transport/required-packages";
 import trpcRouter from "./routers/trpc";
 import logger from "./utils/logger";
 

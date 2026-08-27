@@ -4,7 +4,6 @@ import {
   CallToolRequestSchema,
   CallToolResult,
   CallToolResultSchema,
-  CompatibilityCallToolResultSchema,
   GetPromptRequestSchema,
   GetPromptResultSchema,
   ListPromptsRequestSchema,
@@ -37,6 +36,9 @@ import {
   isExposedAdminToolName,
 } from "../admin-mcp/tools-registry";
 import { configService } from "../config.service";
+import { backgroundToolsSync } from "./background-tools-sync";
+import { normalizeCallToolResult } from "./call-tool-result";
+import { circuitBreaker } from "./circuit-breaker";
 import { ConnectedClient } from "./client";
 import { getMcpServers } from "./fetch-metamcp";
 import { extractForwardedHeaders, mergeHeaders } from "./header-forwarding";
@@ -57,14 +59,10 @@ import { resolveToolIdentity } from "./metamcp-middleware/tool-identity";
 import {
   createToolOverridesCallToolMiddleware,
   createToolOverridesListToolsMiddleware,
-  mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
-import { isBackendSessionLostError } from "./session-error";
-import { normalizeCallToolResult } from "./call-tool-result";
-import { parseToolName } from "./tool-name-parser";
-import { backgroundToolsSync } from "./background-tools-sync";
-import { circuitBreaker } from "./circuit-breaker";
 import { filterOutOverrideTools } from "./override-filter";
+import { isBackendSessionLostError } from "./session-error";
+import { parseToolName } from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
 
@@ -368,7 +366,9 @@ export const createServer = async (
 
     await Promise.allSettled(
       allServerEntries.map(async ([mcpServerUuid, params]) => {
-        logger.debug(`[DEBUG-TOOLS] 🔧 Server: ${params.name || mcpServerUuid}`);
+        logger.debug(
+          `[DEBUG-TOOLS] 🔧 Server: ${params.name || mcpServerUuid}`,
+        );
 
         // Skip if we've already visited this server to prevent circular references
         if (visitedServers.has(mcpServerUuid)) {
