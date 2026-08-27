@@ -1,5 +1,7 @@
 import { ChildProcess, IOType } from "node:child_process";
+import { accessSync, constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
+import path from "node:path";
 import process from "node:process";
 import { PassThrough, Stream } from "node:stream";
 
@@ -144,6 +146,46 @@ export function getDefaultEnvironment(): Record<string, string> {
 }
 
 /**
+ * Best-effort "does this launcher exist and is it executable" probe used by the
+ * fail-fast guard in start().
+ *
+ * - A command containing a path separator is checked directly (absolute or
+ *   relative path — this is the case that matters in production: a git-built
+ *   server whose launcher was never installed, e.g. /home/nextjs/.local/bin/
+ *   mcp-assistant, where `spawn` would otherwise surface ENOENT asynchronously).
+ * - A bare name is resolved through PATH the same way `cross-spawn` does, so
+ *   `npx`, `uvx`, `bun` etc. are found even though they are not files in the
+ *   container.
+ *
+ * Returns true when the command is definitely runnable, false when it is
+ * definitely not. A command we cannot resolve is reported as missing so the
+ * caller fails fast instead of spawning a process that dies in seconds.
+ */
+export function commandIsExecutable(command: string): boolean {
+  if (command.includes("/")) {
+    try {
+      accessSync(command, fsConstants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const pathEnv = process.env.PATH ?? "";
+  const dirs = pathEnv.split(path.delimiter).filter(Boolean);
+  for (const dir of dirs) {
+    const candidate = path.join(dir, command);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      return true;
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  return false;
+}
+
+/**
  * Client transport for stdio: this will connect to a server by spawning a process and communicating with it over stdin/stdout.
  *
  * This transport is only available in Node.js environments.
@@ -156,6 +198,13 @@ export class ProcessManagedStdioTransport implements Transport {
   private _stderrStream: PassThrough | null = null;
   private _isCleanup: boolean = false;
   private _spawnedAt: number | null = null;
+
+  // Set when the spawned process dies before cleanup (a crash, not a
+  // deliberate close). send() rejects with this instead of the passive
+  // "Not connected" marker so the caller can distinguish a connect-stage
+  // spawn failure from a session torn down after a successful connect.
+  private _rejectError: Error | null = null;
+  private _hasClosed = false;
 
   onclose?: () => void;
   onerror?: (error: Error) => void;
@@ -176,6 +225,30 @@ export class ProcessManagedStdioTransport implements Transport {
     if (this._process) {
       throw new Error(
         "StdioClientTransport already started! If using Client class, note that connect() calls start() automatically.",
+      );
+    }
+
+    // Fail fast on a missing launcher instead of spawning a zombie process
+    // that dies in seconds. A launch command that doesn't exist makes
+    // `spawn` succeed (the error only surfaces asynchronously), the process
+    // exits non-zero before the connect handshake, and the pool's connect
+    // retry loop then hammers the missing launcher for minutes (once per
+    // sync pass) — tripping the circuit breaker and reporting "Not connected"
+    // for a server that will never come up. The spawn-concurrency gate keeps
+    // this check at O(1) per cold server.
+    //
+    // Semantics of MCP_STDIO_MISSING_LAUNCHER_ABORT: default is ON (missing
+    // launcher is always fatal — the process can never initialize). Set "0" to
+    // allow a deliberately-missing launcher (boot-path test, or a server whose
+    // launcher is expected to be produced on first request).
+    const launcher = this._serverParams.command;
+    if (
+      launcher &&
+      !commandIsExecutable(launcher) &&
+      process.env.MCP_STDIO_MISSING_LAUNCHER_ABORT !== "0"
+    ) {
+      throw new Error(
+        `MCP stdio launcher not found (${launcher}) — refusing to spawn; set MCP_STDIO_MISSING_LAUNCHER_ABORT=0 to allow the boot-path test`,
       );
     }
 
@@ -221,6 +294,25 @@ export class ProcessManagedStdioTransport implements Transport {
       });
 
       this._process.on("close", (code, signal) => {
+        // Passive disconnect: a spawned process that died after start() but
+        // before the client is torn down must REJECT the pending send()
+        // promise. Without this, Protocol.request()'s promise hangs until
+        // the request timeout while the transport sits half-closed — and any
+        // later request surfaces the SDK's bare "Not connected" instead of
+        // this process's exit reason, so the recovery path can't tell a real
+        // connect failure from a torn-down session.
+        if (
+          !this._isCleanup &&
+          this._process &&
+          !this._hasClosed &&
+          (code !== 0 || signal)
+        ) {
+          this._hasClosed = true;
+          this._rejectError = new Error(
+            `MCP server process exited unexpectedly (code: ${code ?? "null"}, signal: ${signal ?? "null"})`,
+          );
+        }
+
         // Only emit crash event if this wasn't a clean shutdown
         if (!this._isCleanup && (code !== 0 || signal)) {
           logger.warn(`Process crashed with code: ${code}, signal: ${signal}`);
@@ -351,9 +443,10 @@ export class ProcessManagedStdioTransport implements Transport {
   }
 
   send(message: JSONRPCMessage): Promise<void> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       if (!this._process?.stdin) {
-        throw new Error("Not connected");
+        reject(this._rejectError ?? new Error("Not connected"));
+        return;
       }
 
       const json = serializeMessage(message);

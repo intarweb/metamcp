@@ -488,7 +488,10 @@ export const createServer = async (
             pool: mcpServerPool,
             sessionId: context.sessionId,
             serverUuid: mcpServerUuid,
-            params,
+            // Use the forwarded-header-merged params so a recovery re-spawn
+            // rebuilds the backend connection with the same per-client
+            // credentials the original getSession used.
+            params: effectiveParams,
             namespaceUuid,
             operation: "tools/list",
             serverName,
@@ -1051,7 +1054,9 @@ export const createServer = async (
             pool: mcpServerPool,
             sessionId,
             serverUuid: uuid,
-            params,
+            // effectiveParams carries the merged per-client headers; a
+            // recovery re-spawn must rebuild with them, not the bare config.
+            params: effectiveParams,
             namespaceUuid,
             operation: "prompts/list",
             serverName,
@@ -1199,7 +1204,7 @@ export const createServer = async (
             pool: mcpServerPool,
             sessionId,
             serverUuid: uuid,
-            params,
+            params: effectiveParams,
             namespaceUuid,
             operation: "resources/list",
             serverName,
@@ -1380,7 +1385,7 @@ export const createServer = async (
               pool: mcpServerPool,
               sessionId,
               serverUuid: uuid,
-              params,
+              params: effectiveParams,
               namespaceUuid,
               operation: "resources/templates/list",
               serverName,

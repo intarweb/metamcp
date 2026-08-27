@@ -391,7 +391,9 @@ export const connectMetaMcpClient = async (
       metamcpLogStore.addLog(
         "client",
         "error",
-        `Error connecting to MetaMCP client (attempt ${count + 1}/${maxAttempts})`,
+        `Error connecting to MetaMCP client (attempt ${count + 1}/${maxAttempts}): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
         error,
       );
 

@@ -5,6 +5,7 @@ import logger from "@/utils/logger";
 
 import { toolsRepository } from "../../db/repositories";
 import { configService } from "../config.service";
+import { commandIsExecutable } from "../stdio-transport/process-managed-transport";
 import { circuitBreaker } from "./circuit-breaker";
 import { getMcpServers } from "./fetch-metamcp";
 import { filterOutOverrideTools } from "./override-filter";
@@ -173,6 +174,26 @@ class BackgroundToolsSync {
     // Prefer a warm pooled connection (the pool holds idle sessions); fall back
     // to a bounded one-off connect only if the pool has none available.
     const { mcpServerPool } = await import("./mcp-server-pool");
+
+    // Check the missing-launcher condition up front so the tools-sync loop
+    // never sends a stdio server with a broken launcher to the pool — the pool
+    // would spawn it (getSession hands back a ConnectedClient before the
+    // connect handshake completes), the process dies, and the sync reports a
+    // generic failure that is invisible to the circuit breaker's cooldown.
+    // Shares the transport's PATH-aware probe so absolute-path launchers (e.g.
+    // /home/nextjs/.local/bin/mcp-assistant after a failed git install) are
+    // caught too, not just bare command names.
+    if (
+      (!params.type || params.type === "STDIO") &&
+      params.command &&
+      !commandIsExecutable(params.command) &&
+      process.env.MCP_STDIO_MISSING_LAUNCHER_ABORT !== "0"
+    ) {
+      throw new Error(
+        `[tools-sync] stdio launcher not found for ${params.name} (${params.uuid}): ${params.command}`,
+      );
+    }
+
     const session = await mcpServerPool.getSession(
       `tools-sync-${params.uuid}`,
       params.uuid,

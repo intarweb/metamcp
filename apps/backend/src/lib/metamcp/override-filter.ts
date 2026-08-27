@@ -20,9 +20,13 @@ export async function filterOutOverrideTools(
     return tools;
   }
 
-  const filteredTools: Tool[] = [];
-
-  await Promise.allSettled(
+  // Resolve the override verdict per tool in parallel, then filter in the
+  // ORIGINAL array order. Using Promise.allSettled + a push from inside each
+  // async callback makes the result order non-deterministic (array push order
+  // follows completion, not source order) — a stable order keeps the DB tool
+  // list deterministic across sync passes, which is what makes reaping and
+  // diffing converge instead of churning.
+  const verdicts = await Promise.allSettled(
     tools.map(async (tool) => {
       try {
         // Check if this tool name is actually an override name for an existing tool
@@ -36,23 +40,21 @@ export async function filterOutOverrideTools(
 
         // If the original name is different from the current name,
         // this tool is an override and should be filtered out
-        if (originalName !== fullToolName) {
-          // This is an override, skip it (don't save to database)
-          return;
-        }
-
-        // This is not an override, include it
-        filteredTools.push(tool);
+        return originalName === fullToolName;
       } catch (error) {
         logger.error(
           `Error checking if tool ${tool.name} is an override:`,
           error,
         );
         // On error, include the tool (fail-safe behavior)
-        filteredTools.push(tool);
+        return true;
       }
     }),
   );
 
-  return filteredTools;
+  return tools.filter((tool, index) => {
+    const verdict = verdicts[index];
+    // allSettled never rejects; a non-fulfilled verdict defaults to include.
+    return verdict?.status === "fulfilled" ? verdict.value : true;
+  });
 }
